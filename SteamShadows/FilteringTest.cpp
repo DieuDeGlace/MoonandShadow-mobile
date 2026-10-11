@@ -1,98 +1,314 @@
 #include "SteamShadows.cpp"
 #include <cassert>
 #include <array>
-static void STDMETHODCALLTYPE directDraw(ID3D11DeviceContext*c,UINT n,UINT s){c->Draw(n,s);}
-static void STDMETHODCALLTYPE directUpdate(ID3D11DeviceContext*c,ID3D11Resource*r,UINT s,const D3D11_BOX*b,const void*d,UINT row,UINT slice){c->UpdateSubresource(r,s,b,d,row,slice);}
-static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext*c,ID3D11DepthStencilView*d,UINT f,FLOAT z,UINT8 s){c->ClearDepthStencilView(d,f,z,s);}
-int main(){
- ID3D11Device*d=nullptr;ID3D11DeviceContext*c=nullptr;assert(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&d,nullptr,&c)));
- shadows::resolution=128;shadows::softShadows=true;shadows::radius=50;shadows::oldD=directDraw;shadows::oldUpdate=directUpdate;shadows::oldClear=directClear;assert(shadows::initialize(c));
- float vertices[6][4]={{-20.f/255,-20.f/255,0,4.f/255},{20.f/255,-20.f/255,0,4.f/255},{20.f/255,20.f/255,0,4.f/255},{-20.f/255,-20.f/255,0,4.f/255},{20.f/255,20.f/255,0,4.f/255},{-20.f/255,20.f/255,0,4.f/255}};
- D3D11_BUFFER_DESC bd{};bd.ByteWidth=sizeof(vertices);bd.BindFlags=D3D11_BIND_VERTEX_BUFFER;D3D11_SUBRESOURCE_DATA data{vertices};ID3D11Buffer*vb=nullptr;assert(SUCCEEDED(d->CreateBuffer(&bd,&data,&vb)));
- // Both capture-before-motion and motion-before-capture resolve the same mesh.
- ID3D11Buffer* moving=nullptr;assert(SUCCEEDED(d->CreateBuffer(&bd,&data,&moving)));
- shadows::Draw motionDraw{};motionDraw.vb=vb;motionDraw.terrain=true;
- assert(!shadows::animatedTerrain(motionDraw));
- assert(SUCCEEDED(vb->SetPrivateDataInterface(nativeScene::animatedGuid,moving)));
- auto resolved=shadows::animatedTerrain(motionDraw);assert(resolved==moving);resolved->Release();
- nativeScene::ChunkTag tag{vb,{}};assert(SUCCEEDED(moving->SetPrivateData(nativeScene::chunkTagGuid,sizeof(tag),&tag)));
- motionDraw.vb=moving;resolved=shadows::animatedTerrain(motionDraw);assert(resolved==moving);resolved->Release();
- motionDraw.terrain=false;assert(!shadows::animatedTerrain(motionDraw));motionDraw.terrain=true;
- vb->SetPrivateDataInterface(nativeScene::animatedGuid,nullptr);assert(!shadows::animatedTerrain(motionDraw));moving->Release();
- puts("Animated terrain receiver resolves both hook orders and motion toggle-off: PASS");
- D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=512;td.MipLevels=td.ArraySize=1;td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=D3D11_BIND_RENDER_TARGET;ID3D11Texture2D*color=nullptr,*depth=nullptr,*staging=nullptr;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&color)));assert(SUCCEEDED(d->CreateRenderTargetView(color,nullptr,&shadows::target)));
- td.Format=DXGI_FORMAT_D32_FLOAT;td.BindFlags=D3D11_BIND_DEPTH_STENCIL;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&depth)));assert(SUCCEEDED(d->CreateDepthStencilView(depth,nullptr,&shadows::depth)));
- td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=0;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&staging)));
- float white[4]={1,1,1,1};c->ClearRenderTargetView(shadows::target,white);c->ClearDepthStencilView(shadows::depth,D3D11_CLEAR_DEPTH,.6f,0);
- shadows::Draw ground{};ground.vb=vb;vb->AddRef();ground.stride=16;ground.layout=shadows::floatCasterLayout;ground.layout->AddRef();ground.count=6;ground.indexed=false;ground.topology=D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
- for(int i:{0,5,10,15})ground.world[i]=ground.view[i]=ground.proj[i]=1;
- ground.view[10]=-1;ground.view[11]=10;ground.proj[0]=ground.proj[5]=1.f/50;ground.proj[10]=.01f;ground.proj[11]=.5f;ground.light[10]=1;
- shadows::draws.push_back(ground);shadows::sceneViewport={0,0,512,512,0,1};
- shadows::CloudCaster cloud{};cloud.draw=ground;cloud.draw.vb->AddRef();cloud.draw.layout->AddRef();cloud.draw.world[0]=cloud.draw.world[5]=.5f;cloud.draw.world[11]=40;cloud.seen=GetTickCount64();shadows::clouds.push_back(cloud);shadows::frameOriginKnown=true;
- auto keptTarget=shadows::target;keptTarget->AddRef();auto keptDepth=shadows::depth;keptDepth->AddRef();
- shadows::render();assert(shadows::lastCloudCasters==1);c->CopyResource(staging,color);
- D3D11_MAPPED_SUBRESOURCE mapped{};assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));auto pixels=(unsigned char*)mapped.pData;
- auto edgePixels=[&](unsigned char* p,UINT pitch){int n=0;for(int x=0;x<512;x++){int value=p[256*pitch+x*4];if(value>140&&value<248)n++;}return n;};
- int soft=edgePixels(pixels,mapped.RowPitch);assert(pixels[256*mapped.RowPitch+256*4]<200);c->Unmap(staging,0);
- shadows::target=keptTarget;keptTarget->AddRef();shadows::depth=keptDepth;keptDepth->AddRef();
- c->ClearRenderTargetView(keptTarget,white);c->ClearDepthStencilView(keptDepth,D3D11_CLEAR_DEPTH,.6f,0);
- ground.vb->AddRef();ground.layout->AddRef();shadows::draws.push_back(ground);shadows::softShadows=false;shadows::finished=false;
- shadows::render();c->CopyResource(staging,color);assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));
- pixels=(unsigned char*)mapped.pData;int crisp=edgePixels(pixels,mapped.RowPitch);
- assert(pixels[256*mapped.RowPitch+256*4]<200);assert(pixels[256*mapped.RowPitch+168*4]>240);
- c->Unmap(staging,0);printf("Transition pixels: soft=%d crisp=%d\n",soft,crisp);assert(crisp<soft);
+static void STDMETHODCALLTYPE directDraw(ID3D11DeviceContext *c, UINT n, UINT s) {
+    c->Draw(n, s);
+}
+static void STDMETHODCALLTYPE directUpdate(ID3D11DeviceContext *c, ID3D11Resource *r, UINT s,
+                                           const D3D11_BOX *b, const void *d, UINT row,
+                                           UINT slice) {
+    c->UpdateSubresource(r, s, b, d, row, slice);
+}
+static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthStencilView *d, UINT f,
+                                          FLOAT z, UINT8 s) {
+    c->ClearDepthStencilView(d, f, z, s);
+}
+int main() {
+    ID3D11Device *d = nullptr;
+    ID3D11DeviceContext *c = nullptr;
+    assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+                                       D3D11_SDK_VERSION, &d, nullptr, &c)));
+    shadows::resolution = 128;
+    shadows::softShadows = true;
+    shadows::radius = 50;
+    shadows::oldD = directDraw;
+    shadows::oldUpdate = directUpdate;
+    shadows::oldClear = directClear;
+    assert(shadows::initialize(c));
+    float vertices[6][4] = {
+        {-20.f / 255, -20.f / 255, 0, 4.f / 255}, {20.f / 255, -20.f / 255, 0, 4.f / 255},
+        {20.f / 255, 20.f / 255, 0, 4.f / 255},   {-20.f / 255, -20.f / 255, 0, 4.f / 255},
+        {20.f / 255, 20.f / 255, 0, 4.f / 255},   {-20.f / 255, 20.f / 255, 0, 4.f / 255}};
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = sizeof(vertices);
+    bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA data{vertices};
+    ID3D11Buffer *vb = nullptr;
+    assert(SUCCEEDED(d->CreateBuffer(&bd, &data, &vb)));
+    // Both capture-before-motion and motion-before-capture resolve the same mesh.
+    ID3D11Buffer *moving = nullptr;
+    assert(SUCCEEDED(d->CreateBuffer(&bd, &data, &moving)));
+    shadows::Draw motionDraw{};
+    motionDraw.vb = vb;
+    motionDraw.terrain = true;
+    assert(!shadows::animatedTerrain(motionDraw));
+    assert(SUCCEEDED(vb->SetPrivateDataInterface(nativeScene::animatedGuid, moving)));
+    auto resolved = shadows::animatedTerrain(motionDraw);
+    assert(resolved == moving);
+    resolved->Release();
+    nativeScene::ChunkTag tag{vb, {}};
+    assert(SUCCEEDED(moving->SetPrivateData(nativeScene::chunkTagGuid, sizeof(tag), &tag)));
+    motionDraw.vb = moving;
+    resolved = shadows::animatedTerrain(motionDraw);
+    assert(resolved == moving);
+    resolved->Release();
+    motionDraw.terrain = false;
+    assert(!shadows::animatedTerrain(motionDraw));
+    motionDraw.terrain = true;
+    vb->SetPrivateDataInterface(nativeScene::animatedGuid, nullptr);
+    assert(!shadows::animatedTerrain(motionDraw));
+    moving->Release();
+    puts("Animated terrain receiver resolves both hook orders and motion toggle-off: PASS");
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = td.Height = 512;
+    td.MipLevels = td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D *color = nullptr, *depth = nullptr, *staging = nullptr;
+    assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &color)));
+    assert(SUCCEEDED(d->CreateRenderTargetView(color, nullptr, &shadows::target)));
+    td.Format = DXGI_FORMAT_D32_FLOAT;
+    td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+    assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &depth)));
+    assert(SUCCEEDED(d->CreateDepthStencilView(depth, nullptr, &shadows::depth)));
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.BindFlags = 0;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &staging)));
+    float white[4] = {1, 1, 1, 1};
+    c->ClearRenderTargetView(shadows::target, white);
+    c->ClearDepthStencilView(shadows::depth, D3D11_CLEAR_DEPTH, .6f, 0);
+    shadows::Draw ground{};
+    ground.vb = vb;
+    vb->AddRef();
+    ground.stride = 16;
+    ground.layout = shadows::floatCasterLayout;
+    ground.layout->AddRef();
+    ground.count = 6;
+    ground.indexed = false;
+    ground.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    for (int i : {0, 5, 10, 15})
+        ground.world[i] = ground.view[i] = ground.proj[i] = 1;
+    ground.view[10] = -1;
+    ground.view[11] = 10;
+    ground.proj[0] = ground.proj[5] = 1.f / 50;
+    ground.proj[10] = .01f;
+    ground.proj[11] = .5f;
+    ground.light[10] = 1;
+    // Repeated replay binds should issue no redundant uploads or IA changes.
+    auto emptyDraw = ground;
+    emptyDraw.count = 0;
+    shadows::Params cacheParams{};
+    shadows::replayBindings = {};
+    shadows::internal = true;
+    for (int repeat = 0; repeat < 100; ++repeat)
+        shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.uploads == 1);
+    assert(shadows::replayBindings.stateChanges == 4);
+    cacheParams.depthAdjust[0] = .001f;
+    shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.uploads == 2);
+    emptyDraw.offset = 4;
+    shadows::bind(emptyDraw, cacheParams);
+    assert(shadows::replayBindings.stateChanges == 5);
+    shadows::internal = false;
+    shadows::replayBindings = {};
+    puts(
+        "100 identical replay binds: 1 constant upload and 4 IA changes; changed inputs retained: PASS");
+    shadows::draws.push_back(ground);
+    shadows::sceneViewport = {0, 0, 512, 512, 0, 1};
+    shadows::CloudCaster cloud{};
+    cloud.draw = ground;
+    cloud.draw.vb->AddRef();
+    cloud.draw.layout->AddRef();
+    cloud.draw.world[0] = cloud.draw.world[5] = .5f;
+    cloud.draw.world[11] = 40;
+    cloud.seen = GetTickCount64();
+    shadows::clouds.push_back(cloud);
+    shadows::frameOriginKnown = true;
+    auto keptTarget = shadows::target;
+    keptTarget->AddRef();
+    auto keptDepth = shadows::depth;
+    keptDepth->AddRef();
+    shadows::render();
+    assert(shadows::lastCloudCasters == 1);
+    c->CopyResource(staging, color);
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    assert(SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+    auto pixels = (unsigned char *)mapped.pData;
+    auto edgePixels = [&](unsigned char *p, UINT pitch) {
+        int n = 0;
+        for (int x = 0; x < 512; x++) {
+            int value = p[256 * pitch + x * 4];
+            if (value > 140 && value < 248)
+                n++;
+        }
+        return n;
+    };
+    int soft = edgePixels(pixels, mapped.RowPitch);
+    assert(pixels[256 * mapped.RowPitch + 256 * 4] < 200);
+    c->Unmap(staging, 0);
+    shadows::target = keptTarget;
+    keptTarget->AddRef();
+    shadows::depth = keptDepth;
+    keptDepth->AddRef();
+    c->ClearRenderTargetView(keptTarget, white);
+    c->ClearDepthStencilView(keptDepth, D3D11_CLEAR_DEPTH, .6f, 0);
+    ground.vb->AddRef();
+    ground.layout->AddRef();
+    shadows::draws.push_back(ground);
+    shadows::softShadows = false;
+    shadows::finished = false;
+    shadows::render();
+    c->CopyResource(staging, color);
+    assert(SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+    pixels = (unsigned char *)mapped.pData;
+    int crisp = edgePixels(pixels, mapped.RowPitch);
+    assert(pixels[256 * mapped.RowPitch + 256 * 4] < 200);
+    assert(pixels[256 * mapped.RowPitch + 168 * 4] > 240);
+    c->Unmap(staging, 0);
+    printf("Transition pixels: soft=%d crisp=%d\n", soft, crisp);
+    assert(crisp < soft);
 
- // Exercise actual receiver pixels against the existing caster depth map.
- auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4,bool outside=false,bool entity=false){
-  for(auto&v:vertices)v[3]=face/255.f;c->UpdateSubresource(vb,0,nullptr,vertices,0,0);
-  float gray[]={.5f,.5f,.5f,1};c->ClearRenderTargetView(keptTarget,warm?gray:white);
-  shadows::Params params{};assert(shadows::lightMatrix(params,ground));assert(params.config[2]*2048.f<=.00801f);
-  if(warm)params.sunTone[0]=.08f;params.depthAdjust[1]=entity?1.f:0.f;
-  if(nativeLight){params.points[2]=5;params.points[3]=50;params.points[40]=params.points[41]=params.points[42]=1;}
-  if(lantern){params.lantern[2]=2;params.lantern[3]=12;}
-  ID3DDeviceContextState* old=nullptr;shadows::ctx1->SwapDeviceContextState(shadows::state,&old);
-  c->OMSetRenderTargets(1,&keptTarget,keptDepth);c->RSSetState(shadows::raster);c->RSSetViewports(1,&shadows::sceneViewport);
-  c->OMSetDepthStencilState(shadows::testDepth,0);c->OMSetBlendState(shadows::blend,nullptr,~0u);
-  c->VSSetShader(shadows::receiver,nullptr,0);c->PSSetShader(shadows::visibility,nullptr,0);
-  c->VSSetConstantBuffers(0,1,&shadows::constants);c->PSSetConstantBuffers(0,1,&shadows::constants);
-  c->PSSetShaderResources(0,1,&shadows::mapView);c->PSSetSamplers(0,1,&shadows::sampler);
-  shadows::bind(ground,params);
-  ID3D11ShaderResourceView* nullView=nullptr;c->PSSetShaderResources(0,1,&nullView);c->OMSetRenderTargets(0,nullptr,nullptr);
-  shadows::ctx1->SwapDeviceContextState(old,nullptr);shadows::drop(old);
-  c->CopyResource(staging,color);assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));
-  auto pixel=(unsigned char*)mapped.pData+256*mapped.RowPitch+((warm||outside)?168:256)*4;
-  std::array<int,3> result{pixel[0],pixel[1],pixel[2]};c->Unmap(staging,0);return result;
- };
- auto unlit=sampleLocal(false,false),local=sampleLocal(true,false),lantern=sampleLocal(false,true);
- assert(local[0]>unlit[0]+20);assert(lantern[0]>unlit[0]+20);for(int channel=0;channel<3;channel++)assert(lantern[channel]>=253);
- for(int face=0;face<6;face++){auto side=sampleLocal(false,false,false,face);assert(side[0]<200);}
- puts("All six block-face normals receive occluder shadows: PASS");
- // Outside the occluder, sun-facing tops stay lit while away-facing sides
- // retain the same directional shade as inside the occluder.
- auto litTop=sampleLocal(false,false,false,4,true);
- auto awayOutside=sampleLocal(false,false,false,5,true);
- auto awayInside=sampleLocal(false,false,false,5,false);
- assert(litTop[0]>240);assert(awayOutside[0]<200);
- assert(abs(awayOutside[0]-awayInside[0])<=2);
- puts("Away-facing shade stays consistent across caster boundaries: PASS");
- // Entity tolerance must preserve actual occluder shadows and lighting.
- auto entityShadow=sampleLocal(false,false,false,4,false,true);
- auto entityLit=sampleLocal(false,false,false,4,true,true);
- auto entityLantern=sampleLocal(false,true,false,4,false,true);
- assert(entityShadow[0]<200&&entityLit[0]>240&&entityLantern[0]>=253);
- puts("Entity bias retains occluder shadows and lantern illumination: PASS");
- auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
- puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
- // A slanted light on a plane with no occluder must not stripe its own surface.
- shadows::clearClouds();shadows::target=keptTarget;keptTarget->AddRef();shadows::depth=keptDepth;keptDepth->AddRef();
- c->ClearRenderTargetView(keptTarget,white);c->ClearDepthStencilView(keptDepth,D3D11_CLEAR_DEPTH,.6f,0);
- ground.light[8]=.6f;ground.light[9]=.2f;ground.light[10]=.77f;
- ground.vb->AddRef();ground.layout->AddRef();shadows::draws.push_back(ground);shadows::finished=false;shadows::render();
- c->CopyResource(staging,color);assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));
- pixels=(unsigned char*)mapped.pData;int acne=0;for(int y=180;y<330;y++)for(int x=180;x<330;x++)if(pixels[y*mapped.RowPitch+x*4]<230)acne++;
- c->Unmap(staging,0);printf("Unoccluded angled plane dark pixels: %d\n",acne);assert(acne==0);
- shadows::drop(keptTarget);shadows::drop(keptDepth);
- ID3DDeviceContextState*saved=nullptr;shadows::ctx1->SwapDeviceContextState(shadows::state,&saved);ID3D11RenderTargetView*parked=nullptr;ID3D11DepthStencilView*parkedDepth=nullptr;c->OMGetRenderTargets(1,&parked,&parkedDepth);assert(!parked&&!parkedDepth);shadows::ctx1->SwapDeviceContextState(saved,nullptr);shadows::drop(saved);
- shadows::clearClouds();shadows::drop(vb);shadows::drop(color);shadows::drop(depth);shadows::drop(staging);shadows::drop(c);shadows::drop(d);
- puts("Crisp filtering reduces edge blur, retains shadow coverage and releases scene targets: PASS");
+    // Exercise actual receiver pixels against the existing caster depth map.
+    auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
+                           bool outside = false, bool entity = false, bool cached = false) {
+        for (auto &v : vertices)
+            v[3] = face / 255.f;
+        c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
+        float gray[] = {.5f, .5f, .5f, 1};
+        c->ClearRenderTargetView(keptTarget, warm ? gray : white);
+        shadows::Params params{};
+        assert(shadows::lightMatrix(params, ground));
+        assert(params.config[2] * 2048.f <= .00801f);
+        if (warm)
+            params.sunTone[0] = .08f;
+        params.depthAdjust[1] = entity ? 1.f : 0.f;
+        if (nativeLight) {
+            params.points[2] = 5;
+            params.points[3] = 50;
+            params.points[40] = params.points[41] = params.points[42] = 1;
+        }
+        if (lantern) {
+            params.lantern[2] = 2;
+            params.lantern[3] = 12;
+        }
+        ID3DDeviceContextState *old = nullptr;
+        shadows::ctx1->SwapDeviceContextState(shadows::state, &old);
+        c->OMSetRenderTargets(1, &keptTarget, keptDepth);
+        c->RSSetState(shadows::raster);
+        c->RSSetViewports(1, &shadows::sceneViewport);
+        c->OMSetDepthStencilState(shadows::testDepth, 0);
+        c->OMSetBlendState(shadows::blend, nullptr, ~0u);
+        c->VSSetShader(shadows::receiver, nullptr, 0);
+        c->PSSetShader(shadows::visibility, nullptr, 0);
+        c->VSSetConstantBuffers(0, 1, &shadows::constants);
+        c->PSSetConstantBuffers(0, 1, &shadows::constants);
+        c->PSSetShaderResources(0, 1, &shadows::mapView);
+        c->PSSetSamplers(0, 1, &shadows::sampler);
+        shadows::internal = cached;
+        shadows::replayBindings = {};
+        shadows::bind(ground, params);
+        shadows::internal = false;
+        shadows::replayBindings = {};
+        ID3D11ShaderResourceView *nullView = nullptr;
+        c->PSSetShaderResources(0, 1, &nullView);
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        shadows::ctx1->SwapDeviceContextState(old, nullptr);
+        shadows::drop(old);
+        c->CopyResource(staging, color);
+        assert(SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+        auto pixel = (unsigned char *)mapped.pData + 256 * mapped.RowPitch +
+                     ((warm || outside) ? 168 : 256) * 4;
+        std::array<int, 3> result{pixel[0], pixel[1], pixel[2]};
+        c->Unmap(staging, 0);
+        return result;
+    };
+    for (int face = 0; face < 6; ++face) {
+        auto baseline = sampleLocal(false, false, false, face);
+        auto optimized = sampleLocal(false, false, false, face, false, false, true);
+        assert(baseline == optimized);
+    }
+    assert(sampleLocal(false, true, true, 4, false, true) ==
+           sampleLocal(false, true, true, 4, false, true, true));
+    puts(
+        "Cached replay matches baseline GPU pixels for all voxel normals, entity bias and lantern: PASS");
+    auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
+         lantern = sampleLocal(false, true);
+    assert(local[0] > unlit[0] + 20);
+    assert(lantern[0] > unlit[0] + 20);
+    for (int channel = 0; channel < 3; channel++)
+        assert(lantern[channel] >= 253);
+    for (int face = 0; face < 6; face++) {
+        auto side = sampleLocal(false, false, false, face);
+        assert(side[0] < 200);
+    }
+    puts("All six block-face normals receive occluder shadows: PASS");
+    // Outside the occluder, sun-facing tops stay lit while away-facing sides
+    // retain the same directional shade as inside the occluder.
+    auto litTop = sampleLocal(false, false, false, 4, true);
+    auto awayOutside = sampleLocal(false, false, false, 5, true);
+    auto awayInside = sampleLocal(false, false, false, 5, false);
+    assert(litTop[0] > 240);
+    assert(awayOutside[0] < 200);
+    assert(abs(awayOutside[0] - awayInside[0]) <= 2);
+    puts("Away-facing shade stays consistent across caster boundaries: PASS");
+    // Entity tolerance must preserve actual occluder shadows and lighting.
+    auto entityShadow = sampleLocal(false, false, false, 4, false, true);
+    auto entityLit = sampleLocal(false, false, false, 4, true, true);
+    auto entityLantern = sampleLocal(false, true, false, 4, false, true);
+    assert(entityShadow[0] < 200 && entityLit[0] > 240 && entityLantern[0] >= 253);
+    puts("Entity bias retains occluder shadows and lantern illumination: PASS");
+    auto warmPixel = sampleLocal(false, false, true);
+    assert(warmPixel[0] > 135);
+    assert(warmPixel[0] > warmPixel[2] + 8);
+    puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
+    // A slanted light on a plane with no occluder must not stripe its own surface.
+    shadows::clearClouds();
+    shadows::target = keptTarget;
+    keptTarget->AddRef();
+    shadows::depth = keptDepth;
+    keptDepth->AddRef();
+    c->ClearRenderTargetView(keptTarget, white);
+    c->ClearDepthStencilView(keptDepth, D3D11_CLEAR_DEPTH, .6f, 0);
+    ground.light[8] = .6f;
+    ground.light[9] = .2f;
+    ground.light[10] = .77f;
+    ground.vb->AddRef();
+    ground.layout->AddRef();
+    shadows::draws.push_back(ground);
+    shadows::finished = false;
+    shadows::render();
+    c->CopyResource(staging, color);
+    assert(SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)));
+    pixels = (unsigned char *)mapped.pData;
+    int acne = 0;
+    for (int y = 180; y < 330; y++)
+        for (int x = 180; x < 330; x++)
+            if (pixels[y * mapped.RowPitch + x * 4] < 230)
+                acne++;
+    c->Unmap(staging, 0);
+    printf("Unoccluded angled plane dark pixels: %d\n", acne);
+    assert(acne == 0);
+    shadows::drop(keptTarget);
+    shadows::drop(keptDepth);
+    ID3DDeviceContextState *saved = nullptr;
+    shadows::ctx1->SwapDeviceContextState(shadows::state, &saved);
+    ID3D11RenderTargetView *parked = nullptr;
+    ID3D11DepthStencilView *parkedDepth = nullptr;
+    c->OMGetRenderTargets(1, &parked, &parkedDepth);
+    assert(!parked && !parkedDepth);
+    shadows::ctx1->SwapDeviceContextState(saved, nullptr);
+    shadows::drop(saved);
+    shadows::clearClouds();
+    shadows::drop(vb);
+    shadows::drop(color);
+    shadows::drop(depth);
+    shadows::drop(staging);
+    shadows::drop(c);
+    shadows::drop(d);
+    puts(
+        "Crisp filtering reduces edge blur, retains shadow coverage and releases scene targets: PASS");
 }
