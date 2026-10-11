@@ -32,11 +32,11 @@ int main(){
  c->Unmap(staging,0);printf("Transition pixels: soft=%d crisp=%d\n",soft,crisp);assert(crisp<soft);
 
  // Exercise actual receiver pixels against the existing caster depth map.
- auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4,bool outside=false){
+ auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4,bool outside=false,bool entity=false){
   for(auto&v:vertices)v[3]=face/255.f;c->UpdateSubresource(vb,0,nullptr,vertices,0,0);
   float gray[]={.5f,.5f,.5f,1};c->ClearRenderTargetView(keptTarget,warm?gray:white);
   shadows::Params params{};assert(shadows::lightMatrix(params,ground));assert(params.config[2]*2048.f<=.00801f);
-  if(warm)params.sunTone[0]=.08f;
+  if(warm)params.sunTone[0]=.08f;params.depthAdjust[1]=entity?1.f:0.f;
   if(nativeLight){params.points[2]=5;params.points[3]=50;params.points[40]=params.points[41]=params.points[42]=1;}
   if(lantern){params.lantern[2]=2;params.lantern[3]=12;}
   ID3DDeviceContextState* old=nullptr;shadows::ctx1->SwapDeviceContextState(shadows::state,&old);
@@ -64,6 +64,12 @@ int main(){
  assert(litTop[0]>240);assert(awayOutside[0]<200);
  assert(abs(awayOutside[0]-awayInside[0])<=2);
  puts("Away-facing shade stays consistent across caster boundaries: PASS");
+ // Entity tolerance must preserve actual occluder shadows and lighting.
+ auto entityShadow=sampleLocal(false,false,false,4,false,true);
+ auto entityLit=sampleLocal(false,false,false,4,true,true);
+ auto entityLantern=sampleLocal(false,true,false,4,false,true);
+ assert(entityShadow[0]<200&&entityLit[0]>240&&entityLantern[0]>=253);
+ puts("Entity bias retains occluder shadows and lantern illumination: PASS");
  auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
  puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
  // A slanted light on a plane with no occluder must not stripe its own surface.

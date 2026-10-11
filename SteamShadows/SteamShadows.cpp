@@ -118,8 +118,9 @@ cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 conf
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
 V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;o.n=0;o.local=0;return o;}
-// Match the game's matrix-first mad/dot order to preserve its depth precision.
-float4 combine(row_major float4x4 m,float4 r){float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
+// Keep the native y-multiply then x/z/w MAD order. Without precise, FXC
+// swaps the first two terms, producing angle-dependent coplanar triangles.
+float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
 V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
  // Match native point-light attenuation at vertices; no extra light shadow maps.
  [loop]for(int j=0;j<10;j++)if(pointPositions[j].w>0){
@@ -138,7 +139,14 @@ float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv
  float footprint=config.x*config.w*eye.w*min(slope,8);
  if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
  if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
- float bias=config.z+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
+ // Small sprite faces need a stable normal-derived footprint. Screen
+ // derivatives can mix adjacent faces across a pixel quad on these models.
+ if(depthAdjust.y>0){
+  float3 n=normalize(i.n);float denom=max(abs(dot(n,light[2].xyz)),1e-7);
+  footprint=config.x*(abs(dot(n,light[0].xyz))+abs(dot(n,light[1].xyz)))/denom*config.w*config.w*eye.w*eye.w*.5;
+ }
+ float baseBias=depthAdjust.y>0?max(config.z,.1*eye.w*.5):config.z;
+ float bias=baseBias+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
@@ -201,7 +209,7 @@ static void render(){if(draws.empty())return;if(finished||!enabled||failed||!tar
   }
  }
  ctx->RSSetState(receiverRaster);ctx->OMSetRenderTargets(1,&target,depth);ctx->OMSetDepthStencilState(testDepth,0);ctx->OMSetBlendState(blend,nullptr,~0u);ctx->RSSetViewports(1,&originalViewport);ctx->VSSetShader(receiver,nullptr,0);ctx->PSSetShader(visibility,nullptr,0);ctx->PSSetShaderResources(0,1,&mapView);ctx->PSSetSamplers(0,1,&sampler);
- for(auto& x:draws){memcpy(p.view,x.view,64);memcpy(p.proj,x.proj,64);memcpy(p.points,x.pointLights,sizeof(p.points));p.depthAdjust[0]=x.depthOffset;bind(x,p);}
+ for(auto& x:draws){memcpy(p.view,x.view,64);memcpy(p.proj,x.proj,64);memcpy(p.points,x.pointLights,sizeof(p.points));p.depthAdjust[0]=x.depthOffset;float modelScale=sqrtf(x.world[0]*x.world[0]+x.world[1]*x.world[1]+x.world[2]*x.world[2]);p.depthAdjust[1]=!x.terrain&&modelScale<.5f?1.f:0.f;bind(x,p);}
  ID3D11ShaderResourceView* nullView=nullptr;ctx->PSSetShaderResources(0,1,&nullView);ctx->OMSetRenderTargets(0,nullptr,nullptr);ctx1->SwapDeviceContextState(saved,nullptr);drop(saved);if(shot)capture("Mods\\SteamShadows-after.bmp");internal=false;lastCount=(unsigned)draws.size();frames++;QueryPerformanceCounter(&end);totalMs+=1000.*(end.QuadPart-begin.QuadPart)/freq.QuadPart;
  if(frames==1||shot||frames%3600==0){char s[512];sprintf_s(s,"Shadow frame %u: receivers=%u, loaded terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",frames,lastCount,lastTerrainCasters,totalMs/frames,p.eye[0],p.eye[1],p.eye[2],p.sun[0],p.sun[1],p.sun[2],shot?", captured before/after":"");log(s);}clearDraws();}
 static bool record(ID3D11DeviceContext* c,UINT count,UINT start,INT base,bool indexed){if(internal||failed||c->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;if(ctx&&ctx!=c)return false;
