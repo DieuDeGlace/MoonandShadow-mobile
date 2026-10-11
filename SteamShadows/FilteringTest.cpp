@@ -174,7 +174,8 @@ int main() {
 
     // Exercise actual receiver pixels against the existing caster depth map.
     auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
-                           bool outside = false, bool entity = false, bool cached = false) {
+                           bool outside = false, bool entity = false, bool cached = false,
+                           bool compact = false) {
         for (auto &v : vertices)
             v[3] = face / 255.f;
         c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
@@ -187,13 +188,21 @@ int main() {
             params.sunTone[0] = .08f;
         params.depthAdjust[1] = entity ? 1.f : 0.f;
         if (nativeLight) {
-            params.points[2] = 5;
-            params.points[3] = 50;
-            params.points[40] = params.points[41] = params.points[42] = 1;
+            for (int slot : {1, 4, 8}) {
+                params.points[slot * 4 + 2] = 5;
+                params.points[slot * 4 + 3] = 50;
+                params.points[40 + slot * 4] = .3f;
+                params.points[41 + slot * 4] = .2f;
+                params.points[42 + slot * 4] = .4f;
+            }
         }
         if (lantern) {
             params.lantern[2] = 2;
             params.lantern[3] = 12;
+        }
+        if (compact) {
+            shadows::compactPointLights(params);
+            assert(params.depthAdjust[2] == (nativeLight ? 3.f : 0.f));
         }
         ID3DDeviceContextState *old = nullptr;
         shadows::ctx1->SwapDeviceContextState(shadows::state, &old);
@@ -235,6 +244,12 @@ int main() {
            sampleLocal(false, true, true, 4, false, true, true));
     puts(
         "Cached replay matches baseline GPU pixels for all voxel normals, entity bias and lantern: PASS");
+    for (int face = 0; face < 6; ++face)
+        for (bool localLight : {false, true})
+            for (bool lanternLight : {false, true})
+                assert(sampleLocal(localLight, lanternLight, true, face, false, true) ==
+                       sampleLocal(localLight, lanternLight, true, face, false, true, true, true));
+    puts("Compacted local lights match original GPU pixels for all voxel normals: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);

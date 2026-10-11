@@ -376,6 +376,24 @@ static bool lightMatrix(Params &p, const Draw &d) {
     }
     return std::isfinite(eye.x) && std::isfinite(eye.y) && std::isfinite(eye.z);
 }
+// Keep active lights in native order. Empty light slots otherwise cost a
+// branch on every receiver vertex, even when the scene has no local lights.
+static void compactPointLights(Params &params) {
+    unsigned count = 0;
+    for (unsigned source = 0; source < 10; ++source) {
+        if (!(params.points[source * 4 + 3] > 0))
+            continue;
+        if (source != count) {
+            memcpy(params.points + count * 4, params.points + source * 4, 16);
+            memcpy(params.points + 40 + count * 4, params.points + 40 + source * 4, 16);
+        }
+        ++count;
+    }
+    // Spare fields retain the constant-buffer ABI. The flag allows older
+    // unprepared parameters in diagnostics to use the original ten-slot loop.
+    params.depthAdjust[2] = (float)count;
+    params.depthAdjust[3] = 1;
+}
 static const char *hlsl = R"HLSL(
 cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;};
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
@@ -386,7 +404,8 @@ V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(
 float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
 V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
  // Match native point-light attenuation at vertices; no extra light shadow maps.
- [loop]for(int j=0;j<10;j++)if(pointPositions[j].w>0){
+ int lightCount=depthAdjust.w>0?(int)depthAdjust.z:10;
+ [loop]for(int j=0;j<lightCount;j++)if(pointPositions[j].w>0){
   float3 delta=o.w-pointPositions[j].xyz;float d2=dot(delta,delta);
   float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
   float facing=clamp(-4*dot(o.n,delta*rsqrt(max(d2,.0001))),.3,1);
@@ -836,6 +855,7 @@ static void render() {
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
+        compactPointLights(p);
         p.depthAdjust[0] = x.depthOffset;
         float modelScale =
             sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
