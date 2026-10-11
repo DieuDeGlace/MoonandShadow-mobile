@@ -9,6 +9,17 @@ int main(){
  shadows::resolution=128;shadows::softShadows=true;shadows::radius=50;shadows::oldD=directDraw;shadows::oldUpdate=directUpdate;shadows::oldClear=directClear;assert(shadows::initialize(c));
  float vertices[6][4]={{-20.f/255,-20.f/255,0,4.f/255},{20.f/255,-20.f/255,0,4.f/255},{20.f/255,20.f/255,0,4.f/255},{-20.f/255,-20.f/255,0,4.f/255},{20.f/255,20.f/255,0,4.f/255},{-20.f/255,20.f/255,0,4.f/255}};
  D3D11_BUFFER_DESC bd{};bd.ByteWidth=sizeof(vertices);bd.BindFlags=D3D11_BIND_VERTEX_BUFFER;D3D11_SUBRESOURCE_DATA data{vertices};ID3D11Buffer*vb=nullptr;assert(SUCCEEDED(d->CreateBuffer(&bd,&data,&vb)));
+ // Both capture-before-motion and motion-before-capture resolve the same mesh.
+ ID3D11Buffer* moving=nullptr;assert(SUCCEEDED(d->CreateBuffer(&bd,&data,&moving)));
+ shadows::Draw motionDraw{};motionDraw.vb=vb;motionDraw.terrain=true;
+ assert(!shadows::animatedTerrain(motionDraw));
+ assert(SUCCEEDED(vb->SetPrivateDataInterface(nativeScene::animatedGuid,moving)));
+ auto resolved=shadows::animatedTerrain(motionDraw);assert(resolved==moving);resolved->Release();
+ nativeScene::ChunkTag tag{vb,{}};assert(SUCCEEDED(moving->SetPrivateData(nativeScene::chunkTagGuid,sizeof(tag),&tag)));
+ motionDraw.vb=moving;resolved=shadows::animatedTerrain(motionDraw);assert(resolved==moving);resolved->Release();
+ motionDraw.terrain=false;assert(!shadows::animatedTerrain(motionDraw));motionDraw.terrain=true;
+ vb->SetPrivateDataInterface(nativeScene::animatedGuid,nullptr);assert(!shadows::animatedTerrain(motionDraw));moving->Release();
+ puts("Animated terrain receiver resolves both hook orders and motion toggle-off: PASS");
  D3D11_TEXTURE2D_DESC td{};td.Width=td.Height=512;td.MipLevels=td.ArraySize=1;td.SampleDesc.Count=1;td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=D3D11_BIND_RENDER_TARGET;ID3D11Texture2D*color=nullptr,*depth=nullptr,*staging=nullptr;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&color)));assert(SUCCEEDED(d->CreateRenderTargetView(color,nullptr,&shadows::target)));
  td.Format=DXGI_FORMAT_D32_FLOAT;td.BindFlags=D3D11_BIND_DEPTH_STENCIL;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&depth)));assert(SUCCEEDED(d->CreateDepthStencilView(depth,nullptr,&shadows::depth)));
  td.Format=DXGI_FORMAT_R8G8B8A8_UNORM;td.BindFlags=0;td.Usage=D3D11_USAGE_STAGING;td.CPUAccessFlags=D3D11_CPU_ACCESS_READ;assert(SUCCEEDED(d->CreateTexture2D(&td,nullptr,&staging)));
