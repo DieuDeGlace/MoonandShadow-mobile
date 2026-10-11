@@ -28,3 +28,6 @@ Game files, saves, Steam components, credentials and Microsoft runtime installer
 ## Build
 
 Run build-mobile.cmd in a Windows x64 Visual Studio developer shell with clang-cl and Windows SDK libraries on PATH. CMake remains available as documented upstream. The script builds the DLL and runs the moon-rule CPU test; device rendering tests are separate.
+
+## Rendering update and mobile cleanup (2026-10-11)
+Upstream a7861b3 includes formatted source, cached replay bindings/uploads, inactive-light compaction preserving native order, and nonblocking GPU pass timing. MobileBuild.h names the narrow executable identity; NativeScene caches immutable validation but refreshes the game pointer on every query. Mobile75 settings retained. Tests cover pixel equivalence, moving foliage, light compaction, native shader arithmetic and lantern preservation. Paired with updated TemporalAA-mobile/alpha-lookalike-mobile in the actual Steam folder. No measured FPS-improvement claim.
