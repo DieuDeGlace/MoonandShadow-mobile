@@ -35,7 +35,7 @@ int main(){
  auto sampleLocal=[&](bool nativeLight,bool lantern,bool warm=false,int face=4,bool outside=false){
   for(auto&v:vertices)v[3]=face/255.f;c->UpdateSubresource(vb,0,nullptr,vertices,0,0);
   float gray[]={.5f,.5f,.5f,1};c->ClearRenderTargetView(keptTarget,warm?gray:white);
-  shadows::Params params{};assert(shadows::lightMatrix(params,ground));
+  shadows::Params params{};assert(shadows::lightMatrix(params,ground));assert(params.config[2]*2048.f<=.00801f);
   if(warm)params.sunTone[0]=.08f;
   if(nativeLight){params.points[2]=5;params.points[3]=50;params.points[40]=params.points[41]=params.points[42]=1;}
   if(lantern){params.lantern[2]=2;params.lantern[3]=12;}

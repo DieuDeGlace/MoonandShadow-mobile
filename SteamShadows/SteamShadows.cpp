@@ -20,7 +20,7 @@ static const GUID cacheGuid={0x89d60734,0xeda9,0x4bf0,{0xb0,0x61,0xc9,0x11,0x33,
 static bool internal=false,enabled=true,finished=false,failed=false;
 static std::atomic<int> toggleRequest{0},captureRequest{0},disableRequest{0};
 static bool cloudShadows=true,softShadows=false;
-static UINT resolution=4096;static float radius=120,strength=.48f,bias=.00020f,sunWarmth=.03f,fadeStart=.4f;
+static UINT resolution=4096;static float radius=120,strength=.48f,bias=.008f,sunWarmth=.03f,fadeStart=.4f;
 static ID3D11Device* device=nullptr;static ID3D11DeviceContext* ctx=nullptr;static ID3D11DeviceContext1* ctx1=nullptr;
 static ID3DDeviceContextState* state=nullptr;static ID3D11VertexShader *caster=nullptr,*receiver=nullptr;
 static ID3D11PixelShader* visibility=nullptr;static ID3D11Buffer* constants=nullptr;
@@ -112,7 +112,7 @@ memcpy(p.view,d.view,64);memcpy(p.proj,d.proj,64);
  }else if(moonEnabled){sun=norm({moon.direction[0],moon.direction[1],moon.direction[2]});activeStrength=moon.shadowStrength*moon.weight;}
  if(captureRequest.load()==2)sun=norm({.5f,.25f,.8f});Vec f{-sun.x,-sun.y,-sun.z};Vec r=norm(cross(f,fabsf(f.z)>.95f?Vec{0,1,0}:Vec{0,0,1})),u=cross(r,f);float snap=2*radius/resolution;
  float x=floorf(dot(r,eye)/snap+.5f)*snap,y=floorf(dot(u,eye)/snap+.5f)*snap;float span=cloudShadows?2048.f:512.f;float m[16]={r.x/radius,r.y/radius,r.z/radius,-x/radius,u.x/radius,u.y/radius,u.z/radius,-y/radius,f.x/span,f.y/span,f.z/span,.5f-dot(f,eye)/span,0,0,0,1};memcpy(p.light,m,64);
- p.eye[0]=eye.x;p.eye[1]=eye.y;p.eye[2]=eye.z;p.eye[3]=2.f/span;p.sun[0]=sun.x;p.sun[1]=sun.y;p.sun[2]=sun.z;p.sun[3]=softShadows?1.f:0.f;p.config[0]=1.f/resolution;p.config[1]=activeStrength*fmaxf(0.f,fminf(1.f,sun.z/.15f));p.config[2]=bias;p.config[3]=radius;p.sunTone[1]=fadeStart;if(g&&g->world){auto moonPhase=moonrules::state(g->world->state.time);p.sunTone[0]=sunWarmth*(1-moonPhase.weight)*std::clamp(-moonPhase.direction[2]*2.f,0.f,1.f);}return std::isfinite(eye.x)&&std::isfinite(eye.y)&&std::isfinite(eye.z);}
+ p.eye[0]=eye.x;p.eye[1]=eye.y;p.eye[2]=eye.z;p.eye[3]=2.f/span;p.sun[0]=sun.x;p.sun[1]=sun.y;p.sun[2]=sun.z;p.sun[3]=softShadows?1.f:0.f;p.config[0]=1.f/resolution;p.config[1]=activeStrength*fmaxf(0.f,fminf(1.f,sun.z/.15f));p.config[2]=bias/span;p.config[3]=radius;p.sunTone[1]=fadeStart;if(g&&g->world){auto moonPhase=moonrules::state(g->world->state.time);p.sunTone[0]=sunWarmth*(1-moonPhase.weight)*std::clamp(-moonPhase.direction[2]*2.f,0.f,1.f);}return std::isfinite(eye.x)&&std::isfinite(eye.y)&&std::isfinite(eye.z);}
 static const char* hlsl=R"HLSL(
 cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone;};
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
@@ -131,7 +131,7 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
 Texture2D<float> shadowMap:register(t0);SamplerComparisonState shadowSampler:register(s0);
 float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
  if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;float facing=dot(normalize(i.n),sun.xyz);
- float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.25);float bias=max(config.z,config.x*config.w*eye.w*min(slope,3)*1.5);float lit=0;
+ float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.25);float bias=max(config.z,config.x*config.w*eye.w*min(slope,2)*.5);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
