@@ -26,7 +26,7 @@ static ID3DDeviceContextState* state=nullptr;static ID3D11VertexShader *caster=n
 static ID3D11PixelShader* visibility=nullptr;static ID3D11Buffer* constants=nullptr;
 static ID3D11InputLayout *nativeCasterLayout=nullptr,*floatCasterLayout=nullptr;
 static ID3D11Texture2D* texture=nullptr;static ID3D11DepthStencilView* mapDepth=nullptr;static ID3D11ShaderResourceView* mapView=nullptr;
-static ID3D11DepthStencilState *writeDepth=nullptr,*testDepth=nullptr;static ID3D11RasterizerState* raster=nullptr;
+static ID3D11DepthStencilState *writeDepth=nullptr,*testDepth=nullptr;static ID3D11RasterizerState *raster=nullptr,*receiverRaster=nullptr;
 static ID3D11BlendState *blend=nullptr,*opaque=nullptr;static ID3D11SamplerState* sampler=nullptr;
 static ID3D11RenderTargetView* target=nullptr;static ID3D11DepthStencilView* depth=nullptr;static D3D11_VIEWPORT sceneViewport{};
 static unsigned frames=0,lastCount=0;static double totalMs=0;
@@ -40,7 +40,7 @@ using Clear=void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*,ID3D11DepthStencilView
 static DI oldDI;static D oldD;static Map oldMap;static Unmap oldUnmap;static Update oldUpdate;static Clear oldClear;
 static void** table=nullptr;
 struct Mapped{void* data;UINT bytes;};static thread_local std::unordered_map<ID3D11Resource*,Mapped> mapped;
-struct Draw{ID3D11Buffer *vb=nullptr,*ib=nullptr;ID3D11InputLayout* layout=nullptr;UINT stride=0,offset=0,ibOffset=0,count=0,start=0;INT base=0;DXGI_FORMAT format{};D3D11_PRIMITIVE_TOPOLOGY topology{};bool indexed=true,terrain=false;nativeScene::Chunk terrainInfo{};float world[16],view[16],proj[16],light[12];float pointLights[80]{};};
+struct Draw{ID3D11Buffer *vb=nullptr,*ib=nullptr;ID3D11InputLayout* layout=nullptr;UINT stride=0,offset=0,ibOffset=0,count=0,start=0;INT base=0;DXGI_FORMAT format{};D3D11_PRIMITIVE_TOPOLOGY topology{};bool indexed=true,terrain=false;nativeScene::Chunk terrainInfo{};float world[16],view[16],proj[16],light[12];float pointLights[80]{};float depthOffset=0;};
 static std::vector<Draw> draws;
 struct CloudCaster{Draw draw{};double x=0,y=0;ULONGLONG seen=0;};
 static std::vector<Draw> pendingClouds;
@@ -84,7 +84,7 @@ static void refreshTerrain(cube::World*w){
   }
  }clearTerrain();terrainMeshes.swap(next);loadedChunks.swap(nextChunks);
 }
-struct Params{float world[16],view[16],proj[16],light[16],config[4],eye[4],sun[4],points[80],lantern[4],sunTone[4];};
+struct Params{float world[16],view[16],proj[16],light[16],config[4],eye[4],sun[4],points[80],lantern[4],sunTone[4],depthAdjust[4];};
 static void clearDraws(){for(auto& x:draws){drop(x.vb);drop(x.ib);drop(x.layout);}draws.clear();drop(target);drop(depth);}
 static UINT bufferBytes(ID3D11Resource* r){ID3D11Buffer* b=nullptr;if(FAILED(r->QueryInterface(__uuidof(ID3D11Buffer),(void**)&b)))return 0;D3D11_BUFFER_DESC d{};b->GetDesc(&d);b->Release();return (d.BindFlags&D3D11_BIND_CONSTANT_BUFFER)&&d.ByteWidth<=512?d.ByteWidth:0;}
 // Rendering must never wait for a GPU readback. Missing constants skip one draw
@@ -114,13 +114,13 @@ memcpy(p.view,d.view,64);memcpy(p.proj,d.proj,64);
  float x=floorf(dot(r,eye)/snap+.5f)*snap,y=floorf(dot(u,eye)/snap+.5f)*snap;float span=cloudShadows?2048.f:512.f;float m[16]={r.x/radius,r.y/radius,r.z/radius,-x/radius,u.x/radius,u.y/radius,u.z/radius,-y/radius,f.x/span,f.y/span,f.z/span,.5f-dot(f,eye)/span,0,0,0,1};memcpy(p.light,m,64);
  p.eye[0]=eye.x;p.eye[1]=eye.y;p.eye[2]=eye.z;p.eye[3]=2.f/span;p.sun[0]=sun.x;p.sun[1]=sun.y;p.sun[2]=sun.z;p.sun[3]=softShadows?1.f:0.f;p.config[0]=1.f/resolution;p.config[1]=activeStrength*fmaxf(0.f,fminf(1.f,sun.z/.15f));p.config[2]=bias/span;p.config[3]=radius;p.sunTone[1]=fadeStart;if(g&&g->world){auto moonPhase=moonrules::state(g->world->state.time);p.sunTone[0]=sunWarmth*(1-moonPhase.weight)*std::clamp(-moonPhase.direction[2]*2.f,0.f,1.f);}return std::isfinite(eye.x)&&std::isfinite(eye.y)&&std::isfinite(eye.z);}
 static const char* hlsl=R"HLSL(
-cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone;};
+cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;};
 struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
 V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;o.n=0;o.local=0;return o;}
 // Match the game's matrix-first mad/dot order to preserve its depth precision.
 float4 combine(row_major float4x4 m,float4 r){float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
-V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2]),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
+V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
  // Match native point-light attenuation at vertices; no extra light shadow maps.
  [loop]for(int j=0;j<10;j++)if(pointPositions[j].w>0){
   float3 delta=o.w-pointPositions[j].xyz;float d2=dot(delta,delta);
@@ -130,8 +130,15 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
  }o.local=saturate(o.local);return o;}
 Texture2D<float> shadowMap:register(t0);SamplerComparisonState shadowSampler:register(s0);
 float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
- if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;float facing=dot(normalize(i.n),sun.xyz);
- float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.25);float bias=max(config.z,config.x*config.w*eye.w*min(slope,2)*.5);float lit=0;
+ float facing=dot(normalize(i.n),sun.xyz);
+ // Receiver-plane depth change across the comparison sampler footprint.
+ float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);
+ float det=ux.x*uy.y-ux.y*uy.x;
+ float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
+ float footprint=config.x*config.w*eye.w*min(slope,8);
+ if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
+ if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
+ float bias=config.z+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
   [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
   lit/=9;
@@ -160,6 +167,8 @@ static bool initialize(ID3D11DeviceContext* context){if(device)return ctx==conte
  if(ok)ok=SUCCEEDED(device->CreateTexture2D(&td,nullptr,&texture))&&SUCCEEDED(device->CreateDepthStencilView(texture,&dd,&mapDepth))&&SUCCEEDED(device->CreateShaderResourceView(texture,&sd,&mapView));
  D3D11_DEPTH_STENCIL_DESC ds{};ds.DepthEnable=TRUE;ds.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ALL;ds.DepthFunc=D3D11_COMPARISON_LESS_EQUAL;if(ok)ok=SUCCEEDED(device->CreateDepthStencilState(&ds,&writeDepth));ds.DepthWriteMask=D3D11_DEPTH_WRITE_MASK_ZERO;if(ok)ok=SUCCEEDED(device->CreateDepthStencilState(&ds,&testDepth));
  D3D11_RASTERIZER_DESC rs{};rs.FillMode=D3D11_FILL_SOLID;rs.CullMode=D3D11_CULL_NONE;rs.DepthClipEnable=TRUE;rs.MultisampleEnable=TRUE;if(ok)ok=SUCCEEDED(device->CreateRasterizerState(&rs,&raster));
+ // A two-ULP receiver-only depth offset prevents coplanar overlay fighting.
+ rs.DepthBias=-2;rs.DepthBiasClamp=-0.000001f;if(ok)ok=SUCCEEDED(device->CreateRasterizerState(&rs,&receiverRaster));
  D3D11_BLEND_DESC bd{};bd.RenderTarget[0].RenderTargetWriteMask=15;if(ok)ok=SUCCEEDED(device->CreateBlendState(&bd,&opaque));auto& rt=bd.RenderTarget[0];rt.BlendEnable=TRUE;rt.SrcBlend=D3D11_BLEND_ONE;rt.DestBlend=D3D11_BLEND_INV_SRC_ALPHA;rt.BlendOp=D3D11_BLEND_OP_ADD;rt.SrcBlendAlpha=D3D11_BLEND_ZERO;rt.DestBlendAlpha=D3D11_BLEND_ONE;rt.BlendOpAlpha=D3D11_BLEND_OP_ADD;rt.RenderTargetWriteMask=7;if(ok)ok=SUCCEEDED(device->CreateBlendState(&bd,&blend));
  D3D11_SAMPLER_DESC ss{};ss.Filter=D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;ss.AddressU=ss.AddressV=ss.AddressW=D3D11_TEXTURE_ADDRESS_BORDER;ss.BorderColor[0]=ss.BorderColor[1]=ss.BorderColor[2]=ss.BorderColor[3]=1;ss.ComparisonFunc=D3D11_COMPARISON_LESS_EQUAL;ss.MaxLOD=D3D11_FLOAT32_MAX;if(ok)ok=SUCCEEDED(device->CreateSamplerState(&ss,&sampler));
  failed=!ok;char status[256];sprintf_s(status,"D3D11 sun shadow resources ready (%u, radius=%.0f, loader API 7.3); loaded terrain casters and cached cloud casters enabled.",resolution,radius);log(ok?status:"Resource initialization failed; original rendering preserved.");return ok;}
@@ -191,8 +200,8 @@ static void render(){if(draws.empty())return;if(finished||!enabled||failed||!tar
    bind(x,p);++lastCloudCasters;
   }
  }
- ctx->OMSetRenderTargets(1,&target,depth);ctx->OMSetDepthStencilState(testDepth,0);ctx->OMSetBlendState(blend,nullptr,~0u);ctx->RSSetViewports(1,&originalViewport);ctx->VSSetShader(receiver,nullptr,0);ctx->PSSetShader(visibility,nullptr,0);ctx->PSSetShaderResources(0,1,&mapView);ctx->PSSetSamplers(0,1,&sampler);
- for(auto& x:draws){memcpy(p.view,x.view,64);memcpy(p.proj,x.proj,64);memcpy(p.points,x.pointLights,sizeof(p.points));bind(x,p);}
+ ctx->RSSetState(receiverRaster);ctx->OMSetRenderTargets(1,&target,depth);ctx->OMSetDepthStencilState(testDepth,0);ctx->OMSetBlendState(blend,nullptr,~0u);ctx->RSSetViewports(1,&originalViewport);ctx->VSSetShader(receiver,nullptr,0);ctx->PSSetShader(visibility,nullptr,0);ctx->PSSetShaderResources(0,1,&mapView);ctx->PSSetSamplers(0,1,&sampler);
+ for(auto& x:draws){memcpy(p.view,x.view,64);memcpy(p.proj,x.proj,64);memcpy(p.points,x.pointLights,sizeof(p.points));p.depthAdjust[0]=x.depthOffset;bind(x,p);}
  ID3D11ShaderResourceView* nullView=nullptr;ctx->PSSetShaderResources(0,1,&nullView);ctx->OMSetRenderTargets(0,nullptr,nullptr);ctx1->SwapDeviceContextState(saved,nullptr);drop(saved);if(shot)capture("Mods\\SteamShadows-after.bmp");internal=false;lastCount=(unsigned)draws.size();frames++;QueryPerformanceCounter(&end);totalMs+=1000.*(end.QuadPart-begin.QuadPart)/freq.QuadPart;
  if(frames==1||shot||frames%3600==0){char s[512];sprintf_s(s,"Shadow frame %u: receivers=%u, loaded terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",frames,lastCount,lastTerrainCasters,totalMs/frames,p.eye[0],p.eye[1],p.eye[2],p.sun[0],p.sun[1],p.sun[2],shot?", captured before/after":"");log(s);}clearDraws();}
 static bool record(ID3D11DeviceContext* c,UINT count,UINT start,INT base,bool indexed){if(internal||failed||c->GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)return false;if(ctx&&ctx!=c)return false;
@@ -238,7 +247,7 @@ static bool record(ID3D11DeviceContext* c,UINT count,UINT start,INT base,bool in
  if(!draws.empty()&&memcmp(x.view,draws.front().view,64)!=0){drop(x.vb);drop(x.ib);drop(x.layout);return false;}
  ID3D11Buffer* source=x.vb;nativeScene::ChunkTag tag{};UINT tagBytes=sizeof(tag);if(SUCCEEDED(x.vb->GetPrivateData(nativeScene::chunkTagGuid,&tagBytes,&tag))&&tagBytes==sizeof(tag))source=tag.original;
  auto found=loadedChunks.find(source);if(found!=loadedChunks.end()&&fabsf(x.world[0]-1)<.001f&&fabsf(x.world[5]-1)<.001f&&fabsf(x.world[10]-1)<.001f){x.terrain=true;x.terrainInfo=found->second;frameOriginX=double(x.terrainInfo.zone.x)*64-x.world[3];frameOriginY=double(x.terrainInfo.zone.y)*64-x.world[7];frameOriginKnown=true;}
- ID3D11Buffer* offsetBuffer=nullptr;c->VSGetConstantBuffers(8,1,&offsetBuffer);float offsetValues[4]{};if(offsetBuffer&&readBuffer(offsetBuffer,offsetValues,16))x.proj[11]-=offsetValues[0];drop(offsetBuffer);
+ ID3D11Buffer* offsetBuffer=nullptr;c->VSGetConstantBuffers(8,1,&offsetBuffer);float offsetValues[4]{};if(offsetBuffer&&readBuffer(offsetBuffer,offsetValues,16))x.depthOffset=offsetValues[0];drop(offsetBuffer);
  D3D11_VIEWPORT vp{};UINT vpCount=1;c->RSGetViewports(&vpCount,&vp);if(!vpCount||vp.Width<640||vp.Height<360||vp.TopLeftX!=0||vp.TopLeftY!=0){if(captureRequest.load()&&diagnosticRejects++<8){char s[256];sprintf_s(s,"Skipped viewport %.0fx%.0f at %.0f,%.0f",vp.Width,vp.Height,vp.TopLeftX,vp.TopLeftY);log(s);}drop(x.vb);drop(x.ib);drop(x.layout);return false;}
  if(draws.empty()){c->OMGetRenderTargets(1,&target,&depth);sceneViewport=vp;}x.count=count;x.start=start;x.base=base;x.indexed=indexed;draws.push_back(x);return true;}
 static void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext* c,UINT n,UINT s,INT b){record(c,n,s,b,true);oldDI(c,n,s,b);}

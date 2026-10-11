@@ -66,6 +66,14 @@ int main(){
  puts("Away-facing shade stays consistent across caster boundaries: PASS");
  auto warmPixel=sampleLocal(false,false,true);assert(warmPixel[0]>135);assert(warmPixel[0]>warmPixel[2]+8);
  puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
+ // A slanted light on a plane with no occluder must not stripe its own surface.
+ shadows::clearClouds();shadows::target=keptTarget;keptTarget->AddRef();shadows::depth=keptDepth;keptDepth->AddRef();
+ c->ClearRenderTargetView(keptTarget,white);c->ClearDepthStencilView(keptDepth,D3D11_CLEAR_DEPTH,.6f,0);
+ ground.light[8]=.6f;ground.light[9]=.2f;ground.light[10]=.77f;
+ ground.vb->AddRef();ground.layout->AddRef();shadows::draws.push_back(ground);shadows::finished=false;shadows::render();
+ c->CopyResource(staging,color);assert(SUCCEEDED(c->Map(staging,0,D3D11_MAP_READ,0,&mapped)));
+ pixels=(unsigned char*)mapped.pData;int acne=0;for(int y=180;y<330;y++)for(int x=180;x<330;x++)if(pixels[y*mapped.RowPitch+x*4]<230)acne++;
+ c->Unmap(staging,0);printf("Unoccluded angled plane dark pixels: %d\n",acne);assert(acne==0);
  shadows::drop(keptTarget);shadows::drop(keptDepth);
  ID3DDeviceContextState*saved=nullptr;shadows::ctx1->SwapDeviceContextState(shadows::state,&saved);ID3D11RenderTargetView*parked=nullptr;ID3D11DepthStencilView*parkedDepth=nullptr;c->OMGetRenderTargets(1,&parked,&parkedDepth);assert(!parked&&!parkedDepth);shadows::ctx1->SwapDeviceContextState(saved,nullptr);shadows::drop(saved);
  shadows::clearClouds();shadows::drop(vb);shadows::drop(color);shadows::drop(depth);shadows::drop(staging);shadows::drop(c);shadows::drop(d);
