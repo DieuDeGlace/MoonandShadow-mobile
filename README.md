@@ -1,3 +1,7 @@
+# MoonandShadow-mobile
+
+See [mobile compatibility and reduced-intensity preset](MOBILE.md).
+
 # MoonandShadow
 
 A single CubeModLoader API 7.3 mod combining moon lighting, a visible moon disk, dimmer night clouds, and real-time sun/moon/cloud shadows. Made by DieuDeGlace with the aid of AI (OpenAI ChatGPT/Codex). MIT licensed; see THIRD_PARTY_NOTICES.md for SDK attribution. Source migrated from SteamCubeWorldMods.
@@ -24,14 +28,15 @@ Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5
 
 Palette/desaturation now lives in [alpha-lookalike](https://github.com/DieuDeGlace/alpha-lookalike), a separate loader DLL. MoonandShadow applies no fullscreen color grade. Install alpha-lookalike only if wanted. ReShade remains untouched. The optional FinishWorldLighting export allows the palette to finish moon/shadow rendering before grading regardless of hook installation order.
 
-SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (48–120 blocks with Radius=120). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map is now 4096 in the supplied preset; this fade adds no map or pass.
+SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (48ï¿½120 blocks with Radius=120). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map is now 4096 in the supplied preset; this fade adds no map or pass.
 
 Lantern correction retains native illumination and suppresses added directional darkening near the player over the existing 12-block radius. No local-light shadow maps or occlusion tracing are added. Five moon/shadow tests pass; gameplay appearance and performance require live verification.
 
 ## 120-block shadow update
 
-The default map is 4096×4096 with Radius=120. D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
+The default map is 4096ï¿½4096 with Radius=120. D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
 
 The receiver no longer rejects faces pointing sideways/away from the directional light or fades their shadows based on face angle. All six voxel normals now receive occluder shadows; angle remains relevant to sunlight warmth and local lights. Grazing-face depth bias is bounded more tightly to avoid withdrawing shadows from block sides. Existing lantern protection and distance fade are retained.
 
 Side shading correction: faces turned away from the directional light now have a consistent zero direct-light visibility, smoothly transitioning over a narrow grazing angle. Their own shadow-map samples no longer alternate between illuminated and shaded edge pixels. Sun-facing faces still receive ordinary cast shadows. Native ambient color, point-light/lantern protection and the distance fade remain; this is a visual approximation of the reference, not Omega renderer parity. No additional sampling, texture or rendering pass is added.
+
