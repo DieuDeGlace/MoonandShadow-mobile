@@ -13,6 +13,7 @@ static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthSte
     c->ClearDepthStencilView(d, f, z, s);
 }
 int main() {
+    shadows::cascadesEnabled = false;
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
     assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -55,6 +56,7 @@ int main() {
     c->ClearRenderTargetView(shadows::target, white);
     c->ClearDepthStencilView(shadows::depth, D3D11_CLEAR_DEPTH, .6f, 0);
     shadows::Draw ground{};
+    ground.terrain = true;
     ground.vb = vb;
     vb->AddRef();
     ground.stride = 16;

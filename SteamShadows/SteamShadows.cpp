@@ -5,6 +5,7 @@
 #include "../MoonLight/MoonRules.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <d3d11shader.h>
 #include "../GpuPassTimer.h"
 #include <vector>
 #include <unordered_map>
@@ -42,16 +43,23 @@ static ID3D11DeviceContext *ctx = nullptr;
 static ID3D11DeviceContext1 *ctx1 = nullptr;
 static ID3DDeviceContextState *state = nullptr;
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
-static ID3D11PixelShader *visibility = nullptr;
+static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
+static ID3D11VertexShader *modelReceiver = nullptr;
 static ID3D11Buffer *constants = nullptr;
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
+static bool cascadesEnabled = true;
+static UINT nearResolution = 2048;
+static float nearRadius = 32;
+static ID3D11Texture2D *nearTexture = nullptr;
+static ID3D11DepthStencilView *nearDepth = nullptr;
+static ID3D11ShaderResourceView *nearView = nullptr;
 static ID3D11Texture2D *texture = nullptr;
 static ID3D11DepthStencilView *mapDepth = nullptr;
 static ID3D11ShaderResourceView *mapView = nullptr;
 static ID3D11DepthStencilState *writeDepth = nullptr, *testDepth = nullptr;
 static ID3D11RasterizerState *raster = nullptr, *receiverRaster = nullptr;
-static ID3D11BlendState *blend = nullptr, *opaque = nullptr;
-static ID3D11SamplerState *sampler = nullptr;
+static ID3D11BlendState *blend = nullptr, *modelBlend = nullptr, *opaque = nullptr;
+static ID3D11SamplerState *sampler = nullptr, *rawSampler = nullptr;
 static ID3D11RenderTargetView *target = nullptr;
 static ID3D11DepthStencilView *depth = nullptr;
 static D3D11_VIEWPORT sceneViewport{};
@@ -91,6 +99,9 @@ struct Draw {
     nativeScene::Chunk terrainInfo{};
     float world[16], view[16], proj[16], light[12];
     float pointLights[80]{};
+    float material[4] = {1, 1, 1, 1};
+    float ambient[4] = {.3f, .3f, .3f, 0};
+    float lightProtection = 0;
     float depthOffset = 0;
 };
 static std::vector<Draw> draws;
@@ -250,7 +261,8 @@ static void refreshTerrain(cube::World *w) {
 }
 struct Params {
     float world[16], view[16], proj[16], light[16], config[4], eye[4], sun[4], points[80],
-        lantern[4], sunTone[4], depthAdjust[4];
+        lantern[4], sunTone[4], depthAdjust[4], nearLight[16], cascade[4], modelFront[4],
+        modelBack[4], modelAmbient[4], modelDirection[4];
 };
 static void clearDraws() {
     for (auto &x : draws) {
@@ -374,6 +386,22 @@ static bool lightMatrix(Params &p, const Draw &d) {
         p.sunTone[0] = sunWarmth * (1 - moonPhase.weight) *
                        std::clamp(-moonPhase.direction[2] * 2.f, 0.f, 1.f);
     }
+    if (cascadesEnabled) {
+        float nearSnap = 2 * nearRadius / nearResolution;
+        float nx = floorf(dot(r, eye) / nearSnap + .5f) * nearSnap;
+        float ny = floorf(dot(u, eye) / nearSnap + .5f) * nearSnap;
+        memcpy(p.nearLight, p.light, 64);
+        for (int i = 0; i < 3; ++i) {
+            p.nearLight[i] *= radius / nearRadius;
+            p.nearLight[4 + i] *= radius / nearRadius;
+        }
+        p.nearLight[3] = -nx / nearRadius;
+        p.nearLight[7] = -ny / nearRadius;
+        p.cascade[0] = 1.f / nearResolution;
+        p.cascade[1] = nearRadius;
+        p.cascade[2] = nearRadius * .8f;
+        p.cascade[3] = 1;
+    }
     return std::isfinite(eye.x) && std::isfinite(eye.y) && std::isfinite(eye.z);
 }
 // Keep active lights in native order. Empty light slots otherwise cost a
@@ -395,14 +423,30 @@ static void compactPointLights(Params &params) {
     params.depthAdjust[3] = 1;
 }
 static const char *hlsl = R"HLSL(
-cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;};
-struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;};
+cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;row_major float4x4 nearLight;float4 cascade,modelFront,modelBack,modelAmbient,modelDirection;};
+struct V{float4 p:SV_POSITION;float3 w:TEXCOORD0;float3 n:TEXCOORD1;float local:TEXCOORD2;
+#ifdef MODEL_DIRECT_LIGHT
+float3 directFraction:TEXCOORD3;
+#endif
+};
 float3 normal(float a){int n=(int)round(a*255);return n==0?float3(1,0,0):n==1?float3(-1,0,0):n==2?float3(0,1,0):n==3?float3(0,-1,0):n==4?float3(0,0,1):float3(0,0,-1);}
-V caster(float4 p:POSITION){V o;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;o.n=0;o.local=0;return o;}
+V caster(float4 p:POSITION){V o=(V)0;float4 w=mul(world,float4(p.xyz*255,1));o.p=mul(light,w);o.w=w.xyz;return o;}
 // Keep the native y-multiply then x/z/w MAD order. Without precise, FXC
 // swaps the first two terms, producing angle-dependent coplanar triangles.
 float4 combine(row_major float4x4 m,float4 r){precise float4 a=r.y*m[1];a=mad(m[0],r.x,a);a=mad(m[2],r.z,a);return mad(m[3],r.w,a);}
 V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(world,v);row_major float4x4 vw=float4x4(combine(world,view[0]),combine(world,view[1]),combine(world,view[2]),combine(world,view[3]));o.p=float4(dot(combine(vw,proj[0]),v),dot(combine(vw,proj[1]),v),dot(combine(vw,proj[2])-float4(0,0,0,depthAdjust.x),v),dot(combine(vw,proj[3]),v));o.w=w.xyz;o.n=normalize(mul((float3x3)world,normal(p.w)));o.local=0;
+#ifdef MODEL_DIRECT_LIGHT
+ // Omega carries world position directly from the same transform as its
+ // caster and uses inverse-transpose model normals. Axis normals allow this
+ // compact cofactor form, including mirrored and nonuniform transforms.
+ float3 a=float3(world[0].x,world[1].x,world[2].x);
+ float3 b=float3(world[0].y,world[1].y,world[2].y);
+ float3 c=float3(world[0].z,world[1].z,world[2].z);
+ float3 n=normal(p.w);
+ float handedness=dot(a,cross(b,c))<0?-1:1;
+ o.n=normalize((cross(b,c)*n.x+cross(c,a)*n.y+cross(a,b)*n.z)*handedness);
+ float3 localColor=0;
+#endif
  // Match native point-light attenuation at vertices; no extra light shadow maps.
  int lightCount=depthAdjust.w>0?(int)depthAdjust.z:10;
  [loop]for(int j=0;j<lightCount;j++)if(pointPositions[j].w>0){
@@ -410,32 +454,126 @@ V receiver(float4 p:POSITION){V o;float4 v=float4(p.xyz*255,1);float4 w=mul(worl
   float falloff=saturate(1-d2/(pointPositions[j].w*pointPositions[j].w));
   float facing=clamp(-4*dot(o.n,delta*rsqrt(max(d2,.0001))),.3,1);
   o.local+=falloff*falloff*facing*max(pointColors[j].r,max(pointColors[j].g,pointColors[j].b));
- }o.local=saturate(o.local);return o;}
-Texture2D<float> shadowMap:register(t0);SamplerComparisonState shadowSampler:register(s0);
-float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
+#ifdef MODEL_DIRECT_LIGHT
+  localColor+=falloff*falloff*facing*pointColors[j].rgb;
+#endif
+ }o.local=saturate(o.local);
+#ifdef MODEL_DIRECT_LIGHT
+ // Separate native sunlight from ambient/back/local light. A shadow may
+ // remove sunlight; it must not multiply all native illumination by 0.25.
+ float orientation=.5+.5*abs(dot(o.n,float3(.597022,.398015,.696526)));
+ float facing=max(0,.3+.7*dot(o.n,modelDirection.xyz));
+ float3 back=modelBack.rgb*orientation;
+ float3 ambient=modelAmbient.rgb*orientation+localColor;
+ float3 full=saturate(ambient+saturate(back+modelFront.rgb*facing)*modelFront.w);
+ float3 indirect=saturate(ambient+saturate(back)*modelFront.w);
+ o.directFraction=saturate((full-indirect)/max(full,.00001))*(1-modelDirection.w);
+#endif
+ return o;}
+V modelReceiverVertex(float4 p:POSITION){return receiver(p);}
+Texture2D<float> shadowMap:register(t0);Texture2D<float> nearShadowMap:register(t1);SamplerComparisonState shadowSampler:register(s0);
+#ifdef MODEL_PLANE_FILTER
+SamplerState rawShadowSampler:register(s1);
+// Hardware PCF compares four depths to one reference. On a tilted model face,
+// that shadows alternating portions of the face's own texels. A single gather
+// keeps the same 2x2 footprint but compares each texel to its receiver plane.
+float planeComparison(Texture2D<float> map, float2 uv, float z, float2 gradient,
+                      float texel, float baseBias, float2 offset) {
+    float2 grid = (uv + offset * texel) / texel - .5;
+    float2 fraction = frac(grid);
+    float2 lower = floor(grid);
+    float2 delta = (lower + .5) * texel - uv;
+    float reference = z + dot(gradient, delta) - baseBias;
+    // Gather order is lower-left, lower-right, upper-right, upper-left.
+    // Gather at the quad's center so hardware coordinate rounding cannot
+    // select a neighboring quad at a subtexel boundary. Weights stay unsnapped.
+    float4 depths = map.Gather(rawShadowSampler, (lower + 1) * texel);
+    float4 references = reference + texel * float4(gradient.y, gradient.x + gradient.y,
+                                                  gradient.x, 0);
+    float4 taps = step(references, depths);
+    return lerp(lerp(taps.w, taps.z, fraction.x), lerp(taps.x, taps.y, fraction.x), fraction.y);
+}
+bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float texel) {
+    float3 p = mul(transform, float4(worldPosition, 1)).xyz;
+    return all(abs(p.xy) < 1 - 2 * texel) && p.z >= 0 && p.z <= 1;
+}
+float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
+    // At noon the light grazes vertical voxel faces. Their shadow projection
+    // is thinner than a texel, so nearby faces can alternate across the filter
+    // footprint. Give those faces one consistent directional shade instead.
+    // Native ambient/back/local light is retained by the model blend below.
+    float facing = dot(normalize(i.n), sun.xyz);
+    float exposure = smoothstep(.15, .30, facing);
+    [branch] if (exposure <= 0)
+        return 0;
+    if (!modelMapCovered(i.w, transform, region.x))
+        return exposure;
+    float3 p = mul(transform, float4(i.w, 1)).xyz;
+    float2 uv = float2(p.x, -p.y) * .5 + .5;
+    // Signed plane gradient in shadow UV coordinates. The orthographic rows
+    // carry their own scale; eye.w is twice the inverse light-depth span.
+    float denominator = dot(i.n, transform[2].xyz);
+    denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
+    float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
+    float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
+    float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
+    [branch] if (sun.w > .5) {
+        float lit = 0;
+        [unroll] for (int y = -1; y <= 1; y++)
+            [unroll] for (int x = -1; x <= 1; x++)
+                lit += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
+        return exposure * lit / 9;
+    }
+    return exposure * planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+}
+#endif
+float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Texture2D<float> map){
+#ifdef MODEL_PLANE_FILTER
+ return modelPlaneVisibility(i,lightTransform,region,map);
+#else
+ float3 p=mul(lightTransform,float4(i.w,1)).xyz;float2 uv=float2(p.x,-p.y)*.5+.5;
  float facing=dot(normalize(i.n),sun.xyz);
  // Receiver-plane depth change across the comparison sampler footprint.
  float2 ux=ddx(uv),uy=ddy(uv);float zx=ddx(p.z),zy=ddy(p.z);
  float det=ux.x*uy.y-ux.y*uy.x;
  float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
- float footprint=config.x*config.w*eye.w*min(slope,8);
- if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=config.x*(abs(gradient.x)+abs(gradient.y));}
- if(any(uv<config.x)||any(uv>1-config.x)||p.z<0||p.z>1)return 0;
+ float footprint=region.x*region.w*eye.w*min(slope,8);
+ if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=region.x*(abs(gradient.x)+abs(gradient.y));}
+ if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
  // Small sprite faces need a stable normal-derived footprint. Screen
  // derivatives can mix adjacent faces across a pixel quad on these models.
+ float baseBias=region.z;
  if(depthAdjust.y>0){
-  float3 n=normalize(i.n);float denom=max(abs(dot(n,light[2].xyz)),1e-7);
-  footprint=config.x*(abs(dot(n,light[0].xyz))+abs(dot(n,light[1].xyz)))/denom*config.w*config.w*eye.w*eye.w*.5;
+  footprint=0;
+  baseBias=region.z*(1+2*(1-saturate(facing)));
  }
- float baseBias=depthAdjust.y>0?max(config.z,.1*eye.w*.5):config.z;
- float bias=baseBias+min(footprint,config.x*config.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
+ float bias=baseBias+min(footprint,region.x*region.w*eye.w*16)*(sun.w>.5?2.1:1.1);float lit=0;
  [branch]if(sun.w>.5){
-  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=shadowMap.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*config.x,p.z-bias);
+  [unroll]for(int y=-1;y<=1;y++)[unroll]for(int x=-1;x<=1;x++)lit+=map.SampleCmpLevelZero(shadowSampler,uv+float2(x,y)*region.x,p.z-bias);
   lit/=9;
- }else lit=shadowMap.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
+ }else lit=map.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
  // A face turned away from the directional light has no direct contribution.
  // Do not let its own depth samples produce alternating bright edge teeth.
- lit*=smoothstep(0,.08,facing);
+ lit*=depthAdjust.y>0?1:smoothstep(0,.08,facing);
+ return lit;
+#endif
+}
+#ifdef MODEL_DIRECT_LIGHT
+struct ModelOutput { float4 color:SV_TARGET0; float4 transmission:SV_TARGET1; };
+ModelOutput visibility(V i) {
+#else
+float4 visibility(V i):SV_TARGET{
+#endif
+ float facing=dot(normalize(i.n),sun.xyz);float distance=length(i.w.xy-eye.xy);float lit;
+ bool useNear=cascade.w>.5;
+#ifdef MODEL_PLANE_FILTER
+ // Tall models inside the XY radius can lie outside the projected near map.
+ // Use the far map there instead of applying a false dark border.
+ useNear=useNear&&modelMapCovered(i.w,nearLight,cascade.x);
+#endif
+ [branch]if(useNear&&distance<cascade.z)lit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);
+ else{lit=shadowVisibility(i,light,config,shadowMap);
+  [branch]if(useNear&&distance<cascade.y){float nearLit=shadowVisibility(i,nearLight,float4(cascade.x,config.y,config.z,cascade.y),nearShadowMap);lit=lerp(nearLit,lit,smoothstep(cascade.z,cascade.y,distance));}}
  float fade=1-smoothstep(config.w*sunTone.y,config.w,length(i.w.xy-eye.xy));float opacity=(1-lit)*config.y*fade;
  float local=saturate(i.local);float lanternProtection=0;
  if(lantern.w>0){float3 delta=i.w-lantern.xyz;float d2=dot(delta,delta);
@@ -446,7 +584,17 @@ float4 visibility(V i):SV_TARGET{float3 p=mul(light,float4(i.w,1)).xyz;float2 uv
  // stamped a second colored silhouette into the illuminated ground.
  float protection=max(local,lanternProtection);float alpha=opacity*(1-protection);
  float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
- return float4(sunlight,alpha);}
+#ifdef MODEL_DIRECT_LIGHT
+ // Two source colors blend into the same target: sunlight is added as before,
+ // while the transmission factor attenuates only the native sunlight share.
+ ModelOutput output;
+ output.color=float4(sunlight,0);
+ output.transmission=float4(saturate(1-alpha*i.directFraction),1);
+ return output;
+#else
+ return float4(sunlight,alpha);
+#endif
+}
 )HLSL";
 static bool initialize(ID3D11DeviceContext *context) {
     if (device)
@@ -462,23 +610,32 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, levels, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    const char *names[] = {"caster", "receiver", "visibility"};
-    for (int i = 0; i < 3 && ok; i++) {
+    const char *names[] = {"caster", "receiver", "visibility", "modelReceiverVertex", "visibility"};
+    const D3D_SHADER_MACRO modelMacros[] = {
+        {"MODEL_PLANE_FILTER", "1"}, {"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
+    for (int i = 0; i < 5 && ok; ++i) {
         ID3DBlob *code = nullptr, *error = nullptr;
-        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", nullptr, nullptr, names[i],
-                                i < 2 ? "vs_4_0" : "ps_4_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-                                &code, &error);
+        bool vertex = i < 2 || i == 3;
+        HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", i >= 3 ? modelMacros : nullptr,
+                                nullptr, names[i],
+                                vertex   ? "vs_4_0"
+                                : i == 4 ? "ps_4_1"
+                                         : "ps_4_0",
+                                D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error);
         if (error) {
             log((char *)error->GetBufferPointer());
             drop(error);
         }
         ok = SUCCEEDED(hr);
         if (ok)
-            ok = SUCCEEDED(
-                i < 2 ? device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                   nullptr, i ? &receiver : &caster)
-                      : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
-                                                  nullptr, &visibility));
+            ok = vertex ? SUCCEEDED(device->CreateVertexShader(code->GetBufferPointer(),
+                                                               code->GetBufferSize(), nullptr,
+                                                               i == 3   ? &modelReceiver
+                                                               : i == 1 ? &receiver
+                                                                        : &caster))
+                        : SUCCEEDED(device->CreatePixelShader(
+                              code->GetBufferPointer(), code->GetBufferSize(), nullptr,
+                              i == 4 ? &modelVisibility : &visibility));
         if (ok && i == 0) {
             D3D11_INPUT_ELEMENT_DESC element = {
                 "POSITION", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
@@ -516,6 +673,12 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(device->CreateTexture2D(&td, nullptr, &texture)) &&
              SUCCEEDED(device->CreateDepthStencilView(texture, &dd, &mapDepth)) &&
              SUCCEEDED(device->CreateShaderResourceView(texture, &sd, &mapView));
+    if (ok && cascadesEnabled) {
+        td.Width = td.Height = nearResolution;
+        ok = SUCCEEDED(device->CreateTexture2D(&td, nullptr, &nearTexture)) &&
+             SUCCEEDED(device->CreateDepthStencilView(nearTexture, &dd, &nearDepth)) &&
+             SUCCEEDED(device->CreateShaderResourceView(nearTexture, &sd, &nearView));
+    }
     D3D11_DEPTH_STENCIL_DESC ds{};
     ds.DepthEnable = TRUE;
     ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
@@ -552,6 +715,12 @@ static bool initialize(ID3D11DeviceContext *context) {
     rt.RenderTargetWriteMask = 7;
     if (ok)
         ok = SUCCEEDED(device->CreateBlendState(&bd, &blend));
+    // Models keep native ambient/back/point lighting. The pixel shader emits
+    // a per-channel sunlight attenuation multiplier for the existing image.
+    rt.SrcBlend = D3D11_BLEND_ONE;
+    rt.DestBlend = D3D11_BLEND_SRC1_COLOR;
+    if (ok)
+        ok = SUCCEEDED(device->CreateBlendState(&bd, &modelBlend));
     D3D11_SAMPLER_DESC ss{};
     ss.Filter = D3D11_FILTER_COMPARISON_MIN_MAG_LINEAR_MIP_POINT;
     ss.AddressU = ss.AddressV = ss.AddressW = D3D11_TEXTURE_ADDRESS_BORDER;
@@ -560,6 +729,9 @@ static bool initialize(ID3D11DeviceContext *context) {
     ss.MaxLOD = D3D11_FLOAT32_MAX;
     if (ok)
         ok = SUCCEEDED(device->CreateSamplerState(&ss, &sampler));
+    ss.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (ok)
+        ok = SUCCEEDED(device->CreateSamplerState(&ss, &rawSampler));
     failed = !ok;
     char status[256];
     sprintf_s(
@@ -567,6 +739,15 @@ static bool initialize(ID3D11DeviceContext *context) {
         "D3D11 sun shadow resources ready (%u, radius=%.0f, loader API 7.3); loaded terrain casters and cached cloud casters enabled.",
         resolution, radius);
     log(ok ? status : "Resource initialization failed; original rendering preserved.");
+    if (ok)
+        log("Model shadows: direct world transforms, inverse-transpose normals, sunlight-only attenuation.");
+    if (ok && cascadesEnabled) {
+        sprintf_s(
+            status,
+            "Experimental cascades active: near=%u radius=%.0f, far=%u radius=%.0f; one receiver pass.",
+            nearResolution, nearRadius, resolution, radius);
+        log(status);
+    }
     return ok;
 }
 static void capture(const char *path) {
@@ -735,9 +916,28 @@ static void bind(const Draw &x, Params &p) {
         oldD(ctx, x.count, x.start);
     drop(animated);
 }
+// Project the packed terrain's conservative bounds into the light map.
+// Tall chunks can cast into the near region from well outside its ground radius.
+static bool terrainIntersectsMap(const Draw &draw, const Params &parameters) {
+    float center[3] = {draw.world[3] + 32, draw.world[7] + 32, draw.world[11] + 127.5f};
+    for (int row : {0, 4}) {
+        const float *m = parameters.light + row;
+        float projected = m[0] * center[0] + m[1] * center[1] + m[2] * center[2] + m[3];
+        float extent = std::abs(m[0]) * 33 + std::abs(m[1]) * 33 + std::abs(m[2]) * 127.5f;
+        if (projected + extent < -1 || projected - extent > 1)
+            return false;
+    }
+    return true;
+}
 static void render() {
     if (draws.empty())
         return;
+    // A camera/projection can also belong to the rotating menu preview. Only
+    // native terrain establishes the world origin for the supported game.
+    if (nativeScene::supported() && !frameOriginKnown) {
+        clearDraws();
+        return;
+    }
     if (finished || !enabled || failed || !target || !depth) {
         if (enabled && diagnosticRejects++ < 8) {
             char s[256];
@@ -778,69 +978,81 @@ static void render() {
     ctx->PSSetShader(nullptr, nullptr, 0);
     ctx->OMSetBlendState(opaque, nullptr, ~0u);
     ctx->OMSetDepthStencilState(writeDepth, 0);
-    ctx->OMSetRenderTargets(0, nullptr, mapDepth);
-    oldClear(ctx, mapDepth, D3D11_CLEAR_DEPTH, 1, 0);
-    D3D11_VIEWPORT vp{0, 0, (float)resolution, (float)resolution, 0, 1};
-    ctx->RSSetViewports(1, &vp);
-    // Derive the current floating world origin from a visible native terrain chunk.
-    auto reference =
-        std::find_if(draws.begin(), draws.end(), [](const Draw &d) { return d.terrain; });
-    lastTerrainCasters = 0;
-    if (reference != draws.end() && !terrainMeshes.empty()) {
-        double ox = double(reference->terrainInfo.zone.x) * 64 - reference->world[3],
-               oy = double(reference->terrainInfo.zone.y) * 64 - reference->world[7];
-        for (auto &m : terrainMeshes) {
-            Draw x{};
-            x.vb = m.vb;
-            x.ib = m.ib;
-            x.count = m.count;
-            x.format = m.format;
-            x.stride = 8;
-            x.layout = nativeCasterLayout;
-            x.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-            x.world[0] = x.world[5] = x.world[10] = x.world[15] = 1;
-            x.world[3] = (float)(double(m.info.zone.x) * 64 - ox);
-            x.world[7] = (float)(double(m.info.zone.y) * 64 - oy);
-            x.world[11] = (float)m.info.z;
-            ID3D11Buffer *animated = nullptr;
-            UINT bytes = sizeof(animated);
-            if (SUCCEEDED(m.vb->GetPrivateData(nativeScene::animatedGuid, &bytes, &animated)) &&
-                animated) {
-                x.vb = animated;
-                x.stride = 20;
-                x.layout = floatCasterLayout;
+    Params receiverParameters = p;
+    for (unsigned cascadePass = 0; cascadePass < (cascadesEnabled ? 2u : 1u); ++cascadePass) {
+        UINT passResolution = cascadePass ? nearResolution : resolution;
+        float passRadius = cascadePass ? nearRadius : radius;
+        if (cascadePass)
+            memcpy(p.light, receiverParameters.nearLight, 64);
+        ctx->OMSetRenderTargets(0, nullptr, cascadePass ? nearDepth : mapDepth);
+        oldClear(ctx, cascadePass ? nearDepth : mapDepth, D3D11_CLEAR_DEPTH, 1, 0);
+        D3D11_VIEWPORT vp{0, 0, (float)passResolution, (float)passResolution, 0, 1};
+        ctx->RSSetViewports(1, &vp);
+        // Derive the current floating world origin from a visible native terrain chunk.
+        auto reference =
+            std::find_if(draws.begin(), draws.end(), [](const Draw &d) { return d.terrain; });
+        lastTerrainCasters = 0;
+        if (reference != draws.end() && !terrainMeshes.empty()) {
+            double ox = double(reference->terrainInfo.zone.x) * 64 - reference->world[3],
+                   oy = double(reference->terrainInfo.zone.y) * 64 - reference->world[7];
+            for (auto &m : terrainMeshes) {
+                Draw x{};
+                x.vb = m.vb;
+                x.ib = m.ib;
+                x.count = m.count;
+                x.format = m.format;
+                x.stride = 8;
+                x.layout = nativeCasterLayout;
+                x.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+                x.world[0] = x.world[5] = x.world[10] = x.world[15] = 1;
+                x.world[3] = (float)(double(m.info.zone.x) * 64 - ox);
+                x.world[7] = (float)(double(m.info.zone.y) * 64 - oy);
+                x.world[11] = (float)m.info.z;
+                ID3D11Buffer *animated = nullptr;
+                UINT bytes = sizeof(animated);
+                if (SUCCEEDED(m.vb->GetPrivateData(nativeScene::animatedGuid, &bytes, &animated)) &&
+                    animated) {
+                    x.vb = animated;
+                    x.stride = 20;
+                    x.layout = floatCasterLayout;
+                }
+                if (!cascadePass || terrainIntersectsMap(x, p)) {
+                    bind(x, p);
+                    lastTerrainCasters++;
+                }
+                drop(animated);
             }
-            bind(x, p);
-            drop(animated);
-            lastTerrainCasters++;
-        }
-        for (auto &x : draws)
-            if (!x.terrain)
+            for (auto &x : draws)
+                if (!x.terrain)
+                    bind(x, p);
+        } else
+            for (auto &x : draws)
                 bind(x, p);
-    } else
-        for (auto &x : draws)
-            bind(x, p);
-    // Clouds cast only: never replay them as darkened scene receivers.
-    lastCloudCasters = 0;
-    if (cloudShadows && frameOriginKnown) {
-        float drift[2]{};
-        cloudDrift(drift);
-        for (auto &cached : clouds) {
-            Draw x = cached.draw;
-            x.world[3] = (float)(cached.x - frameOriginX) + drift[0];
-            x.world[7] = (float)(cached.y - frameOriginY) + drift[1];
-            float extent = 24 * (std::max)(std::abs(x.world[0]),
-                                           (std::max)(std::abs(x.world[5]), std::abs(x.world[10])));
-            float lx = p.light[0] * x.world[3] + p.light[1] * x.world[7] +
-                       p.light[2] * x.world[11] + p.light[3],
-                  ly = p.light[4] * x.world[3] + p.light[5] * x.world[7] +
-                       p.light[6] * x.world[11] + p.light[7];
-            if (std::abs(lx) > 1 + extent / radius || std::abs(ly) > 1 + extent / radius)
-                continue;
-            bind(x, p);
-            ++lastCloudCasters;
+        // Clouds cast only: never replay them as darkened scene receivers.
+        lastCloudCasters = 0;
+        if (cloudShadows && frameOriginKnown) {
+            float drift[2]{};
+            cloudDrift(drift);
+            for (auto &cached : clouds) {
+                Draw x = cached.draw;
+                x.world[3] = (float)(cached.x - frameOriginX) + drift[0];
+                x.world[7] = (float)(cached.y - frameOriginY) + drift[1];
+                float extent =
+                    24 * (std::max)(std::abs(x.world[0]),
+                                    (std::max)(std::abs(x.world[5]), std::abs(x.world[10])));
+                float lx = p.light[0] * x.world[3] + p.light[1] * x.world[7] +
+                           p.light[2] * x.world[11] + p.light[3],
+                      ly = p.light[4] * x.world[3] + p.light[5] * x.world[7] +
+                           p.light[6] * x.world[11] + p.light[7];
+                if (std::abs(lx) > 1 + extent / passRadius ||
+                    std::abs(ly) > 1 + extent / passRadius)
+                    continue;
+                bind(x, p);
+                ++lastCloudCasters;
+            }
         }
     }
+    p = receiverParameters;
     gpuTimer.split(ctx);
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
@@ -849,21 +1061,42 @@ static void render() {
     ctx->RSSetViewports(1, &originalViewport);
     ctx->VSSetShader(receiver, nullptr, 0);
     ctx->PSSetShader(visibility, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, &mapView);
-    ctx->PSSetSamplers(0, 1, &sampler);
+    ID3D11ShaderResourceView *shadowViews[] = {mapView, nearView};
+    ctx->PSSetShaderResources(0, 2, shadowViews);
+    ID3D11SamplerState *shadowSamplers[] = {sampler, rawSampler};
+    ctx->PSSetSamplers(0, 2, shadowSamplers);
+    bool modelShaderBound = false;
     for (auto &x : draws) {
+        bool useModelShader = !x.terrain;
+        if (useModelShader != modelShaderBound) {
+            ctx->VSSetShader(useModelShader ? modelReceiver : receiver, nullptr, 0);
+            ctx->PSSetShader(useModelShader ? modelVisibility : visibility, nullptr, 0);
+            ctx->OMSetBlendState(useModelShader ? modelBlend : blend, nullptr, ~0u);
+        }
+        modelShaderBound = useModelShader;
+        if (useModelShader) {
+            memcpy(p.modelFront, x.light, 16);
+            memcpy(p.modelBack, x.light + 4, 16);
+            memcpy(p.modelAmbient, x.ambient, 16);
+            memcpy(p.modelDirection, x.light + 8, 16);
+            p.modelFront[3] = x.material[3];
+            p.modelDirection[3] = x.lightProtection;
+        }
         memcpy(p.view, x.view, 64);
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
         compactPointLights(p);
         p.depthAdjust[0] = x.depthOffset;
-        float modelScale =
-            sqrtf(x.world[0] * x.world[0] + x.world[1] * x.world[1] + x.world[2] * x.world[2]);
-        p.depthAdjust[1] = !x.terrain && modelScale < .5f ? 1.f : 0.f;
+        // Native models use varied scales. Selecting their tolerance by scale
+        // can leave parts of the same actor on the terrain self-shadow path.
+        p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
+        // Native model linkage is verified; close models can now use the
+        // focused map, retaining hair/armor contact shadows at finer density.
+        p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
         bind(x, p);
     }
-    ID3D11ShaderResourceView *nullView = nullptr;
-    ctx->PSSetShaderResources(0, 1, &nullView);
+    ID3D11ShaderResourceView *nullViews[2]{};
+    ctx->PSSetShaderResources(0, 2, nullViews);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
     ctx1->SwapDeviceContextState(saved, nullptr);
     gpuTimer.end(ctx);
@@ -966,6 +1199,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     bool ok = readBuffer(buffers[0], x.proj, 64) && readBuffer(buffers[1], x.view, 64) &&
               readBuffer(buffers[2], x.world, 64) && readBuffer(buffers[5], x.light, 48);
     readBuffer(buffers[4], x.pointLights, 320);
+    readBuffer(buffers[3], x.material, 16);
     for (auto &b : buffers)
         drop(b);
     if (!ok)
@@ -1053,12 +1287,25 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
     }
-    ID3D11Buffer *offsetBuffer = nullptr;
-    c->VSGetConstantBuffers(8, 1, &offsetBuffer);
     float offsetValues[4]{};
-    if (offsetBuffer && readBuffer(offsetBuffer, offsetValues, 16))
-        x.depthOffset = offsetValues[0];
-    drop(offsetBuffer);
+    if (x.terrain) {
+        ID3D11Buffer *offsetBuffer = nullptr;
+        c->VSGetConstantBuffers(8, 1, &offsetBuffer);
+        readBuffer(offsetBuffer, offsetValues, 16);
+        drop(offsetBuffer);
+    } else {
+        ID3D11Buffer *extraBuffers[4]{};
+        c->VSGetConstantBuffers(6, 4, extraBuffers);
+        readBuffer(extraBuffers[0], x.ambient, 16);
+        float whiteValues[4]{}, glowValues[4]{};
+        readBuffer(extraBuffers[1], whiteValues, 16);
+        readBuffer(extraBuffers[3], glowValues, 16);
+        x.lightProtection = std::clamp(std::max(whiteValues[0], glowValues[0]), 0.f, 1.f);
+        readBuffer(extraBuffers[2], offsetValues, 16);
+        for (auto &b : extraBuffers)
+            drop(b);
+    }
+    x.depthOffset = offsetValues[0];
     D3D11_VIEWPORT vp{};
     UINT vpCount = 1;
     c->RSGetViewports(&vpCount, &vp);
@@ -1126,6 +1373,12 @@ static void STDMETHODCALLTYPE clear(ID3D11DeviceContext *c, ID3D11DepthStencilVi
         render();
         clearDraws();
         finished = false;
+        auto motionModule = GetModuleHandleW(L"WorldMotion.dll");
+        auto beginMotion =
+            motionModule ? (void(WINAPI *)())GetProcAddress(motionModule, "BeginWorldMotionFrame")
+                         : nullptr;
+        if (beginMotion)
+            beginMotion();
         if (toggleRequest.exchange(0) || GetAsyncKeyState(VK_F7) & 1) {
             enabled = !enabled;
             log(enabled ? "Shadows enabled." : "Shadows disabled.");
@@ -1191,6 +1444,14 @@ static DWORD attach() {
         GetPrivateProfileIntW(L"Shadows", L"Resolution", 4096, L".\\Mods\\SteamShadows.ini");
     resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
     radius = (float)GetPrivateProfileIntW(L"Shadows", L"Radius", 120, L".\\Mods\\SteamShadows.ini");
+    cascadesEnabled =
+        GetPrivateProfileIntW(L"Shadows", L"Cascades", 1, L".\\Mods\\SteamShadows.ini") != 0;
+    nearResolution = std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048,
+                                                            L".\\Mods\\SteamShadows.ini"),
+                                512u, 4096u);
+    nearRadius = std::clamp(
+        (float)GetPrivateProfileIntW(L"Shadows", L"NearRadius", 32, L".\\Mods\\SteamShadows.ini"),
+        8.f, std::max(8.f, radius * .75f));
     radius = radius < 8 ? 8 : radius > 128 ? 128 : radius;
     strength =
         GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 48, L".\\Mods\\SteamShadows.ini") *

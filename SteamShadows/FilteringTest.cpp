@@ -14,6 +14,13 @@ static void STDMETHODCALLTYPE directClear(ID3D11DeviceContext *c, ID3D11DepthSte
     c->ClearDepthStencilView(d, f, z, s);
 }
 int main() {
+#if defined(TEST_CASCADES) || defined(TEST_MODEL_RECEIVER)
+    shadows::cascadesEnabled = true;
+    shadows::nearResolution = 128;
+    shadows::nearRadius = 25;
+#else
+    shadows::cascadesEnabled = false;
+#endif
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
     assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -81,6 +88,7 @@ int main() {
     c->ClearRenderTargetView(shadows::target, white);
     c->ClearDepthStencilView(shadows::depth, D3D11_CLEAR_DEPTH, .6f, 0);
     shadows::Draw ground{};
+    ground.terrain = true;
     ground.vb = vb;
     vb->AddRef();
     ground.stride = 16;
@@ -97,6 +105,7 @@ int main() {
     ground.proj[10] = .01f;
     ground.proj[11] = .5f;
     ground.light[10] = 1;
+
     // Repeated replay binds should issue no redundant uploads or IA changes.
     auto emptyDraw = ground;
     emptyDraw.count = 0;
@@ -175,7 +184,8 @@ int main() {
     // Exercise actual receiver pixels against the existing caster depth map.
     auto sampleLocal = [&](bool nativeLight, bool lantern, bool warm = false, int face = 4,
                            bool outside = false, bool entity = false, bool cached = false,
-                           bool compact = false) {
+                           bool compact = false, bool modelPath = false, bool focusedModel = false,
+                           float contactGap = -1, bool ambientOnly = false) {
         for (auto &v : vertices)
             v[3] = face / 255.f;
         c->UpdateSubresource(vb, 0, nullptr, vertices, 0, 0);
@@ -186,7 +196,16 @@ int main() {
         assert(params.config[2] * 2048.f <= .00801f);
         if (warm)
             params.sunTone[0] = .08f;
+        params.modelFront[0] = params.modelFront[1] = params.modelFront[2] = .8f;
+        params.modelFront[3] = 1;
+        params.modelBack[0] = params.modelBack[1] = params.modelBack[2] = .05f;
+        params.modelAmbient[0] = params.modelAmbient[1] = params.modelAmbient[2] = .1f;
+        params.modelDirection[2] = 1;
+        if (ambientOnly)
+            params.modelFront[0] = params.modelFront[1] = params.modelFront[2] = 0;
         params.depthAdjust[1] = entity ? 1.f : 0.f;
+        if (entity && !focusedModel)
+            params.cascade[3] = 0;
         if (nativeLight) {
             for (int slot : {1, 4, 8}) {
                 params.points[slot * 4 + 2] = 5;
@@ -204,26 +223,37 @@ int main() {
             shadows::compactPointLights(params);
             assert(params.depthAdjust[2] == (nativeLight ? 3.f : 0.f));
         }
+        if (contactGap >= 0) {
+            float closestDepth = params.light[11] - contactGap * params.eye[3] * .5f;
+            c->ClearDepthStencilView(shadows::mapDepth, D3D11_CLEAR_DEPTH, closestDepth, 0);
+            if (shadows::nearDepth)
+                c->ClearDepthStencilView(shadows::nearDepth, D3D11_CLEAR_DEPTH, closestDepth, 0);
+        }
         ID3DDeviceContextState *old = nullptr;
         shadows::ctx1->SwapDeviceContextState(shadows::state, &old);
         c->OMSetRenderTargets(1, &keptTarget, keptDepth);
         c->RSSetState(shadows::raster);
         c->RSSetViewports(1, &shadows::sceneViewport);
         c->OMSetDepthStencilState(shadows::testDepth, 0);
-        c->OMSetBlendState(shadows::blend, nullptr, ~0u);
-        c->VSSetShader(shadows::receiver, nullptr, 0);
-        c->PSSetShader(shadows::visibility, nullptr, 0);
+        c->OMSetBlendState((modelPath || focusedModel) ? shadows::modelBlend : shadows::blend,
+                           nullptr, ~0u);
+        c->VSSetShader((modelPath || focusedModel) ? shadows::modelReceiver : shadows::receiver,
+                       nullptr, 0);
+        c->PSSetShader((modelPath || focusedModel) ? shadows::modelVisibility : shadows::visibility,
+                       nullptr, 0);
         c->VSSetConstantBuffers(0, 1, &shadows::constants);
         c->PSSetConstantBuffers(0, 1, &shadows::constants);
-        c->PSSetShaderResources(0, 1, &shadows::mapView);
-        c->PSSetSamplers(0, 1, &shadows::sampler);
+        ID3D11ShaderResourceView *maps[] = {shadows::mapView, shadows::nearView};
+        c->PSSetShaderResources(0, 2, maps);
+        ID3D11SamplerState *shadowSamplers[] = {shadows::sampler, shadows::rawSampler};
+        c->PSSetSamplers(0, 2, shadowSamplers);
         shadows::internal = cached;
         shadows::replayBindings = {};
         shadows::bind(ground, params);
         shadows::internal = false;
         shadows::replayBindings = {};
-        ID3D11ShaderResourceView *nullView = nullptr;
-        c->PSSetShaderResources(0, 1, &nullView);
+        ID3D11ShaderResourceView *nullViews[2]{};
+        c->PSSetShaderResources(0, 2, nullViews);
         c->OMSetRenderTargets(0, nullptr, nullptr);
         shadows::ctx1->SwapDeviceContextState(old, nullptr);
         shadows::drop(old);
@@ -232,6 +262,15 @@ int main() {
         auto pixel = (unsigned char *)mapped.pData + 256 * mapped.RowPitch +
                      ((warm || outside) ? 168 : 256) * 4;
         std::array<int, 3> result{pixel[0], pixel[1], pixel[2]};
+        assert(pixel[3] == 255);
+        if (focusedModel && contactGap >= 0) {
+            for (int y = 248; y < 264; ++y)
+                for (int x = 248; x < 264; ++x) {
+                    auto sample = (unsigned char *)mapped.pData + y * mapped.RowPitch + x * 4;
+                    for (int channel = 0; channel < 3; ++channel)
+                        assert(abs(sample[channel] - result[channel]) <= 1);
+                }
+        }
         c->Unmap(staging, 0);
         return result;
     };
@@ -250,6 +289,18 @@ int main() {
                 assert(sampleLocal(localLight, lanternLight, true, face, false, true) ==
                        sampleLocal(localLight, lanternLight, true, face, false, true, true, true));
     puts("Compacted local lights match original GPU pixels for all voxel normals: PASS");
+    for (int face : {4, 5}) {
+        // The game already lights model faces. An unoccluded model must not
+        // receive another directional darkening overlay on its away faces.
+        // These are the two valid normals of this XY plane. Other orientations
+        // are exercised with matching slanted geometry in ModelPlaneTest.
+        auto model = sampleLocal(false, false, false, face, true, true, true, false, true);
+        assert(model[0] > 240 && model[1] > 240 && model[2] > 240);
+    }
+    auto modelOccluded = sampleLocal(false, false, false, 4, false, true, true, false, true);
+    assert(modelOccluded[0] < 200);
+    puts(
+        "Model receivers avoid duplicate directional shading while retaining cast occlusion: PASS");
     auto unlit = sampleLocal(false, false), local = sampleLocal(true, false),
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);
@@ -280,6 +331,21 @@ int main() {
     assert(warmPixel[0] > 135);
     assert(warmPixel[0] > warmPixel[2] + 8);
     puts("Native point-light and lantern preservation without synthetic shadow-colored fill: PASS");
+    auto modelWarm = sampleLocal(false, false, true, 4, true, true, true, false, true);
+    assert(modelWarm[0] > 135 && modelWarm[0] > modelWarm[2] + 8);
+    puts("Model blend retains additive warm sunlight and native target alpha: PASS");
+#ifdef TEST_MODEL_RECEIVER
+    auto cleanFace = sampleLocal(false, false, false, 4, false, true, true, false, false, true, 0);
+    auto closeHair =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f);
+    assert(cleanFace[0] > 240 && closeHair[0] < 200);
+    puts(
+        "Direct-world model: uniform clean face and 0.08-block sunlight contact shadow retained PASS");
+    auto ambientFace =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
+    assert(ambientFace[0] >= 253 && ambientFace[1] >= 253 && ambientFace[2] >= 253);
+    puts("Occluded model retains native ambient light when sunlight is absent: PASS");
+#endif
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
     shadows::target = keptTarget;
