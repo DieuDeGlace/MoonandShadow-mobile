@@ -54,6 +54,28 @@ inline bool cloud(cube::World *world, ID3D11Buffer *buffer) {
     return false;
 }
 
+// 1 when `buffer` is the native lily-pad sprite, 2 for the lily flower, else 0.
+// WaterLilies places many of these on freshwater; the slots and model sizes
+// are the ones it verifies before placing them.
+inline int lily(cube::World *world, ID3D11Buffer *buffer) {
+    if (!world || !world->spritemanager || !buffer)
+        return 0;
+    const auto &sprites = world->spritemanager->sprites;
+    constexpr size_t flowerSprite = 0xd23, padSprite = 0xd24;
+    for (size_t index : {padSprite, flowerSprite}) {
+        if (index >= sprites.size())
+            continue;
+        auto s = sprites[index];
+        bool flower = index == flowerSprite;
+        if (s && s->lowering_this_makes_plants_go_fast == 4 &&
+            s->something_with_offset_1 == (flower ? 13 : 9) &&
+            s->something_with_offset_2 == (flower ? 14 : 9) && s->gfx_D3D11VertexBuffer &&
+            s->gfx_D3D11VertexBuffer->buffer == buffer)
+            return flower ? 2 : 1;
+    }
+    return 0;
+}
+
 // Where a terrain chunk buffer lives: its zone and vertical chunk index.
 struct Chunk {
     IntVector2 zone;

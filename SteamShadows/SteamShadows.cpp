@@ -163,6 +163,9 @@ struct Draw {
     DXGI_FORMAT format{};
     D3D11_PRIMITIVE_TOPOLOGY topology{};
     bool indexed = true, terrain = false;
+    // A flat lily pad on the water: it receives shadows but casts none (its
+    // one-voxel-thick shadow would fall directly under itself, on the water).
+    bool lilyPad = false, lily = false;
     nativeScene::Chunk terrainInfo{};
     float world[16], view[16], proj[16], light[12];
     float pointLights[80]{};
@@ -1241,7 +1244,7 @@ static void renderTerrainCasters(const Draw &reference, Params &p, bool nearPass
         drop(animated);
     }
     for (auto &x : draws)
-        if (!x.terrain && intersectsMap(x, p)) {
+        if (!x.terrain && !x.lilyPad && intersectsMap(x, p)) {
             bind(x, p);
             ++lastModelCasters;
         }
@@ -1288,7 +1291,7 @@ static void renderCasters(Params &p, unsigned cascade) {
         renderTerrainCasters(*reference, p, nearPass);
     else
         for (auto &x : draws)
-            if (intersectsMap(x, p)) {
+            if (!x.lilyPad && intersectsMap(x, p)) {
                 bind(x, p);
                 ++lastModelCasters;
             }
@@ -1310,7 +1313,7 @@ static void renderCasters(Params &p, unsigned cascade) {
 struct ReceiverStats {
     ID3D11Query *query = nullptr;
     bool pending = false, failed = false;
-    unsigned frame = 0, terrain = 0, models = 0, lights = 0;
+    unsigned frame = 0, terrain = 0, models = 0, lilies = 0, lights = 0;
 };
 static ReceiverStats receiverStats;
 static void collectReceiverStats() {
@@ -1323,9 +1326,9 @@ static void collectReceiverStats() {
     s.pending = false;
     char line[320];
     sprintf_s(line,
-              "Receiver work: terrain=%u models=%u draws, %u active point lights (max), "
+              "Receiver work: terrain=%u models=%u (lilies %u) draws, %u active point lights (max), "
               "VS invocations=%llu, PS invocations=%llu, triangles=%llu",
-              s.terrain, s.models, s.lights, (unsigned long long)data.VSInvocations,
+              s.terrain, s.models, s.lilies, s.lights, (unsigned long long)data.VSInvocations,
               (unsigned long long)data.PSInvocations, (unsigned long long)data.CInvocations);
     log(line);
 }
@@ -1339,7 +1342,7 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         stats.failed = FAILED(device->CreateQuery(&desc, &stats.query));
         measure = !stats.failed;
     }
-    unsigned terrainReceivers = 0, modelReceivers = 0, maxLights = 0;
+    unsigned terrainReceivers = 0, modelReceivers = 0, lilyReceivers = 0, maxLights = 0;
     if (measure)
         ctx->Begin(stats.query);
     ctx->RSSetState(receiverRaster);
@@ -1379,6 +1382,7 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         compactPointLights(p);
         maxLights = std::max(maxLights, (unsigned)p.depthAdjust[2]);
         ++(x.terrain ? terrainReceivers : modelReceivers);
+        lilyReceivers += x.lily;
         p.depthAdjust[0] = x.depthOffset;
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
@@ -1390,6 +1394,7 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         stats.pending = true;
         stats.terrain = terrainReceivers;
         stats.models = modelReceivers;
+        stats.lilies = lilyReceivers;
         stats.lights = maxLights;
     }
 }
@@ -1679,6 +1684,10 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginX = double(x.terrainInfo.zone.x) * 64 - x.world[3];
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
+    } else if (auto game = nativeScene::game()) {
+        int kind = nativeScene::lily(game->world, source);
+        x.lily = kind != 0;
+        x.lilyPad = kind == 1;
     }
     // Native lighting extras and depth offset (b6-b9; the same shader draws
     // terrain and models).
