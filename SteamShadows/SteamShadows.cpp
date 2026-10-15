@@ -1453,6 +1453,9 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     inlineFrame.originX = frameOriginX;
     inlineFrame.originY = frameOriginY;
     inlineFrame.ready = frameOriginKnown;
+    // The maps changed: any later inline draw (this pass can run mid-frame, from
+    // FinishWorldLighting) must upload the matching parameters, never mix them.
+    inlineFrame.uploaded = false;
     ID3D11PixelShader *bound = nullptr;
     lastReceivers = 0;
     for (auto &x : draws) {
@@ -1878,7 +1881,11 @@ static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     c->VSGetShader(&nativeVS, nullptr, nullptr);
     c->PSGetShader(&nativePS, nullptr, nullptr);
     int vsKind = nativeKind(nativeVS), psKind = nativeKind(nativePS);
-    if (vsKind != 1 || (psKind != 2 && psKind != 3)) {
+    // A large floating-origin jump since the maps were rendered: their area no
+    // longer covers this view well; use the receiver pass for this frame.
+    double shiftX = frameOriginX - inlineFrame.originX, shiftY = frameOriginY - inlineFrame.originY;
+    bool nearby = std::abs(shiftX) <= 32 && std::abs(shiftY) <= 32;
+    if (vsKind != 1 || (psKind != 2 && psKind != 3) || !nearby) {
         drop(nativeVS);
         drop(nativePS);
         return false;
