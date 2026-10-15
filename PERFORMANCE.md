@@ -40,3 +40,25 @@ These changes do not alter the image. The 3072/2048 maps, filtering, camera/dusk
 - In the combined mod, one Map/Unmap/Update hook layer (MoonLight's) mirrors native constants into one shared cache. Previously two layers each stored every write. Buffers are classified with `GetType` instead of `QueryInterface`.
 - Replayed draws go straight past MoonLight's per-draw hook, which never applies to this pass's own constants. MoonLight computes its moon state once per game-clock value instead of per draw. The supported-executable check is cached.
 - `SteamShadows.log` reports captured/receiver/model-caster counts. Every minute it also logs the capture hook's CPU time per frame, sampled every 60th frame.
+
+## Inline terrain shadows, 2026-10-15
+
+The receiver pass replayed every visible draw a second time to darken shadowed areas. Terrain chunks are its largest part: they have the most vertices and cover most of the screen.
+
+Terrain now gets its shadow inside the native draw:
+
+- **Shader copies.** `InlineTerrain.h` re-expresses Steam's world vertex shader (`0x436fb0`) and the two world pixel shaders used for terrain (`0x438810` shine, `0x43b500` plain) instruction by instruction.
+- **Shadow term in place.** The pixel shader applies the receiver's shadow term directly: native × transmission + sun warmth. That is what the receiver's blend did to the stored native colour.
+- **Draw-time swap.** The game's shaders are recognised by their DXBC checksum when they are created. While the previous frame's shadow maps are valid, the copies are swapped in for native terrain draws, and the receiver pass skips those draws.
+- **No per-draw uploads.** Native constants stay in their own slots (b0–b9). The shadow parameters use b12, and the floating-origin shift uses b13.
+- **Fallbacks.** Models keep the receiver pass, so their self-shadows stay current-frame. Terrain drawn with any other shader also stays on the receiver pass, as does everything when `InlineTerrain=0` is set in `SteamShadows.ini`.
+- **Trade-off.** Terrain samples the shadow maps one frame later, so a moving caster's ground shadow lags by one frame.
+
+Validation, on the RX 6600 against the installed executable's own shaders:
+
+- `NativeEquivalenceTest`:
+  - Vertex shader: 98,304 random vertices, native UBYTE4 and WorldMotion float layouts, random native constants. Positions and depth are exact; the largest colour difference is 7 ULP.
+  - Both pixel shaders: 0 ULP over 12 × 65,536 pixels each.
+- `InlineTerrainTest`: native draw plus the real receiver pass versus the real inline draw function, with a shadow map that shades about 19,000 pixels, point lights, and a shifted floating origin. The maximum difference is 1/255, which is 8-bit rounding. Overlapping coplanar faces were left out; the receiver pass blends such faces twice, while the inline draw shades them once.
+
+The live frame cost still needs `SteamShadows.log`: "inline terrain=N" in the frame line, and "Receiver work" for the remaining receivers.
