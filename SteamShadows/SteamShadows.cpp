@@ -23,6 +23,7 @@
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
 #include "../GpuPassTimer.h"
+#include "InlineTerrain.h"
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -163,6 +164,12 @@ struct Draw {
     DXGI_FORMAT format{};
     D3D11_PRIMITIVE_TOPOLOGY topology{};
     bool indexed = true, terrain = false;
+    // A flat lily pad on the water: it receives shadows but casts none (its
+    // one-voxel-thick shadow would fall directly under itself, on the water).
+    bool lilyPad = false, lily = false;
+    // Drawn with the inline terrain shaders (shadow applied in the native draw),
+    // so the receiver pass skips it.
+    bool inlined = false;
     nativeScene::Chunk terrainInfo{};
     float world[16], view[16], proj[16], light[12];
     float pointLights[80]{};
@@ -349,6 +356,14 @@ struct Params {
         lantern[4], sunTone[4], depthAdjust[4], nearLight[16], cascade[4], modelFront[4],
         modelBack[4], modelAmbient[4], modelDirection[4];
 };
+// The frame whose casters the shadow maps hold, for next frame's inline terrain.
+struct InlineFrame {
+    bool ready = false;    // maps hold that frame's casters
+    bool uploaded = false; // inlineConstants hold `params` (once per frame)
+    Params params{};
+    double originX = 0, originY = 0;
+};
+static InlineFrame inlineFrame;
 static void clearDraws() {
     for (auto &x : draws)
         releaseDraw(x);
@@ -1357,6 +1372,7 @@ static void render() {
         return;
     }
     if (finished || !enabled || failed || !target || !depth) {
+        inlineFrame.ready = false;
         if (enabled && diagnosticRejects++ < 8) {
             char s[256];
             sprintf_s(s,
@@ -1421,6 +1437,9 @@ static void render() {
         capture("Mods\\SteamShadows-after.bmp");
     internal = false;
     lastCount = (unsigned)draws.size();
+    lastInline = 0;
+    for (auto &x : draws)
+        lastInline += x.inlined;
     frames++;
     QueryPerformanceCounter(&end);
     totalMs += 1000. * (end.QuadPart - begin.QuadPart) / freq.QuadPart;
@@ -1631,6 +1650,10 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         frameOriginX = double(x.terrainInfo.zone.x) * 64 - x.world[3];
         frameOriginY = double(x.terrainInfo.zone.y) * 64 - x.world[7];
         frameOriginKnown = true;
+    } else if (auto game = nativeScene::game()) {
+        int kind = nativeScene::lily(game->world, source);
+        x.lily = kind != 0;
+        x.lilyPad = kind == 1;
     }
     // Native lighting extras and depth offset (b6-b9; the same shader draws
     // terrain and models).
@@ -1743,6 +1766,7 @@ static void STDMETHODCALLTYPE clear(ID3D11DeviceContext *c, ID3D11DepthStencilVi
         render();
         clearDraws();
         finished = false;
+        inlineFrame.uploaded = false;
         auto motionModule = GetModuleHandleW(L"WorldMotion.dll");
         auto beginMotion =
             motionModule ? (void(WINAPI *)())GetProcAddress(motionModule, "BeginWorldMotionFrame")
@@ -1858,6 +1882,18 @@ static DWORD attach() {
     HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
                                    D3D11_SDK_VERSION, &d, nullptr, &c);
     bool ok = SUCCEEDED(hr) && install(c);
+    // Recognise Steam's world shaders as the game creates them (inline terrain).
+    if (ok && inlineTerrainEnabled) {
+        auto dv = *(void ***)d;
+        oldCreateVS = (CreateVS)dv[SLOT_CREATE_VERTEX_SHADER];
+        oldCreatePS = (CreatePS)dv[SLOT_CREATE_PIXEL_SHADER];
+        if (!patch(dv + SLOT_CREATE_VERTEX_SHADER, (void *)createVS))
+            inlineTerrainEnabled = false;
+        else if (!patch(dv + SLOT_CREATE_PIXEL_SHADER, (void *)createPS)) {
+            patch(dv + SLOT_CREATE_VERTEX_SHADER, (void *)oldCreateVS);
+            inlineTerrainEnabled = false;
+        }
+    }
     drop(c);
     drop(d);
     return ok ? 1 : 0;
