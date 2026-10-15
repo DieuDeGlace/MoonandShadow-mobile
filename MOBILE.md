@@ -44,3 +44,18 @@ Installed into the actual GameNative Steam folder with a rollback installer; thr
 Rollback: close GameNative and restore all three backed-up DLLs together. Keep the existing INIs. The normal Steam-folder launcher was restored after the one-time installer. Geo/.NET, saves, Steam auth, driver/DXVK/Proton and other installed mods were not replaced.
 
 For all rendering tests: build-mobile.cmd --gpu followed by an optional quoted path to your supported cubeworld.exe. NativeClipTest skips with exit 77 if the exact private fixture is absent; no game shader binaries are distributed.
+
+## PC sync and receiver diagnostics (2026-10-15)
+
+Merged upstream MoonandShadow `perf/shadow-receiver-diagnostics`, which includes PC main through 7880a89. That brings:
+
+- the shadow overhead reductions and camera-distance fade;
+- dusk/dawn fading;
+- the noon terrain banding fix;
+- daytime shadows cast from the game's own light direction.
+
+The new diagnostic logs one receiver workload line every 600 shadow frames: vertex/pixel invocations, triangles, terrain/model receiver counts and active point lights. It uses a non-blocking pipeline-statistics query and does not change the image.
+
+`MobileBuild.h` and the phone-only identity check are kept. The phone's own `SteamShadows.ini`/`MoonLight.ini` are never overwritten by the installer.
+
+All 9 tests pass, and NativeClipTest shows 0 mismatches against the local executable.

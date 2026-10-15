@@ -1,3 +1,12 @@
+// MoonLight: moonlit nights for Cube World (Steam, 64-bit, D3D11).
+//
+//   * Night lighting: for every native world draw at night, the light and
+//     ambient constant buffers are replaced by brightened, blue-tinted copies
+//     (and clouds are dimmed), then the originals are rebound after the draw.
+//   * Visible moon: a pixel-styled disk drawn at the far plane, depth-tested
+//     against the scene, just before the first HUD draw.
+// The moon follows the game clock (see MoonRules.h). Built either on its own or
+// as part of MoonandShadow (MOON_AND_SHADOW).
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "cwsdk.h"
@@ -24,12 +33,27 @@ static void log(const char *s) {
         fclose(f);
     }
 }
+
+// ===========================================================================
+// Constants and state
+// ===========================================================================
+
+// ID3D11DeviceContext vtable slots.
+constexpr UINT SLOT_DRAW_INDEXED = 12, SLOT_DRAW = 13, SLOT_MAP = 14, SLOT_UNMAP = 15,
+               SLOT_UPDATE_SUBRESOURCE = 48;
+// Vertex-shader constant buffer slots of a native world draw.
+constexpr UINT CB_PROJECTION = 0, CB_VIEW = 1, CB_MATERIAL = 3, CB_LIGHT = 5, CB_AMBIENT = 6,
+               CB_WHITE = 7, NATIVE_CB_COUNT = 9;
+
+// Settings (see MoonLight.ini).
 static bool enabled = true, internal = false, visibleMoon = true;
 static float amount = .04f, cloudScale = .55f, shadowStrength = .20f;
+// Native sun direction, published for other mods.
 static std::atomic<float> sunX{0}, sunY{0}, sunZ{0};
 static std::atomic<bool> sunKnown{false};
-static const GUID cacheGuid = {
-    0x3530b23e, 0xcdae, 0x4a69, {0xa1, 0x7e, 0x23, 0x18, 0xcb, 0x7e, 0x10, 0x06}};
+// Private-data key for the shadow copy of each small constant buffer (shared
+// with SteamShadows).
+static const GUID cacheGuid = nativeScene::constantCacheGuid;
 using DI = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT, INT);
 using D = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, UINT, UINT);
 using Map = HRESULT(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, D3D11_MAP,
@@ -42,10 +66,12 @@ static D oldD;
 static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
-static void **table = nullptr;
+static void **table = nullptr; // Hooked context vtable (set once attached).
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
+// Our replacement constant buffers.
 static ID3D11Buffer *light = nullptr, *ambient = nullptr, *material = nullptr, *white = nullptr;
+// Moon disk resources.
 static ID3D11DeviceContext1 *context1 = nullptr;
 static ID3DDeviceContextState *skyState = nullptr;
 static ID3D11VertexShader *skyVS = nullptr;
@@ -54,46 +80,61 @@ static ID3D11Buffer *skyConstants = nullptr;
 static ID3D11BlendState *skyBlend = nullptr;
 static ID3D11DepthStencilState *skyDepth = nullptr;
 static ID3D11RasterizerState *skyRaster = nullptr;
+// Scene target, depth and camera captured from this frame's first world draw.
 static ID3D11RenderTargetView *skyTarget = nullptr;
 static ID3D11DepthStencilView *sceneDepth = nullptr;
 static D3D11_VIEWPORT skyViewport{};
 static float sceneView[16]{}, sceneProjection[16]{};
-static bool skyReady = false, skyFinished = false;
+static bool skyReady = false;    // skyTarget/sceneDepth/camera captured this frame.
+static bool skyFinished = false; // The moon was handled this frame.
 struct Mapped {
     void *data;
     UINT size;
 };
-static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped;
+static thread_local std::unordered_map<ID3D11Resource *, Mapped> mapped; // Currently mapped.
 #ifdef MOON_TEST
 static MoonState testPhase;
 static bool testCloud = false;
 #endif
+
+// The moon state for the current game time (no moon while disabled or in menus).
 static MoonState current() {
 #ifdef MOON_TEST
     return testPhase;
 #else
     auto g = nativeScene::game();
-    auto s = enabled && g && g->world && g->world->local_creature
-                 ? moonrules::state(g->world->state.time, shadowStrength)
-                 : MoonState{};
-    return s;
+    if (!enabled || !g || !g->world || !g->world->local_creature)
+        return MoonState{};
+    // Every native draw asks; the game clock changes at most once per frame.
+    static float cachedTime = NAN;
+    static MoonState cached{};
+    float time = g->world->state.time;
+    if (!(time == cachedTime)) {
+        cached = moonrules::state(time, shadowStrength);
+        cachedTime = time;
+    }
+    return cached;
 #endif
 }
+
+// ===========================================================================
+// Constant-buffer shadow copies
+// ===========================================================================
+
+// Size of `r` if it is a small constant buffer, otherwise 0. Also covers the
+// larger buffers SteamShadows reads, so the combined mod stores each native
+// constant write once.
 static UINT bytes(ID3D11Resource *r) {
-    ID3D11Buffer *b = nullptr;
-    if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
-        return 0;
-    D3D11_BUFFER_DESC d{};
-    b->GetDesc(&d);
-    drop(b);
-    return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth <= 64 ? d.ByteWidth : 0;
+    return nativeScene::cachedConstantBytes(r);
 }
+// Reads the shadow copy of a constant buffer's contents.
 static bool read(ID3D11Buffer *b, void *out, UINT n) {
     if (!b)
         return false;
     UINT got = n;
     return SUCCEEDED(b->GetPrivateData(cacheGuid, &got, out)) && got == n;
 }
+// Writes one of our buffers, skipping the upload when the contents are unchanged.
 static void upload(ID3D11DeviceContext *c, ID3D11Buffer *b, const void *data, UINT n) {
     unsigned char previous[64];
     if (read(b, previous, n) && memcmp(previous, data, n) == 0)
@@ -101,16 +142,29 @@ static void upload(ID3D11DeviceContext *c, ID3D11Buffer *b, const void *data, UI
     oldUpdate(c, b, 0, nullptr, data, 0, 0);
     b->SetPrivateData(cacheGuid, n, data);
 }
+
+// ===========================================================================
+// Visible moon
+// ===========================================================================
+
 static void clearSky() {
     drop(skyTarget);
     drop(sceneDepth);
     skyReady = false;
 }
+
+// vs: full-screen triangle at the far plane. ps: pixel-styled disk with three
+// craters; b0 = (centre x, centre y, radius, alpha) in pixels.
 static const char *skyCode = R"HLSL(
 cbuffer Moon:register(b0){float4 disk;};
-float4 vs(uint id:SV_VertexID):SV_POSITION{float2 p=float2((id<<1)&2,id&2);return float4(p*float2(2,-2)+float2(-1,1),.9999999,1);}
+float4 vs(uint id:SV_VertexID):SV_POSITION{
+    float2 p=float2((id<<1)&2,id&2);
+    return float4(p*float2(2,-2)+float2(-1,1),.9999999,1);
+}
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
- float2 q=floor((p.xy-disk.xy)/3)*3/disk.z;float d=length(q);if(d>1)discard;
+ float2 q=floor((p.xy-disk.xy)/3)*3/disk.z;
+ float d=length(q);
+ if(d>1)discard;
  float crater=0;
  crater+=length(q-float2(-.3,.2))<.20?.10:0;
  crater+=length(q-float2(.3,-.25))<.15?.07:0;
@@ -119,6 +173,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
  return float4(float3(.66,.76,.92)-crater, disk.w*(.8+.2*edge));
 }
 )HLSL";
+
 static bool initializeSky() {
     if (skyVS)
         return skyState && skyPS && skyConstants && skyBlend && skyDepth && skyRaster;
@@ -133,17 +188,19 @@ static bool initializeSky() {
                                                      __uuidof(ID3D11Device), nullptr, &skyState));
     drop(d1);
     for (int i = 0; i < 2 && ok; i++) {
+        bool pixel = i == 1;
         ID3DBlob *code = nullptr, *error = nullptr;
         ok = SUCCEEDED(D3DCompile(skyCode, strlen(skyCode), "MoonDisk", nullptr, nullptr,
-                                  i ? "ps" : "vs", i ? "ps_4_0" : "vs_4_0",
+                                  pixel ? "ps" : "vs", pixel ? "ps_4_0" : "vs_4_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &error));
         if (error)
             log((char *)error->GetBufferPointer());
         if (ok)
-            ok = SUCCEEDED(i ? device->CreatePixelShader(code->GetBufferPointer(),
-                                                         code->GetBufferSize(), nullptr, &skyPS)
-                             : device->CreateVertexShader(code->GetBufferPointer(),
-                                                          code->GetBufferSize(), nullptr, &skyVS));
+            ok = SUCCEEDED(pixel ? device->CreatePixelShader(code->GetBufferPointer(),
+                                                             code->GetBufferSize(), nullptr, &skyPS)
+                                 : device->CreateVertexShader(code->GetBufferPointer(),
+                                                              code->GetBufferSize(), nullptr,
+                                                              &skyVS));
         drop(code);
         drop(error);
     }
@@ -153,6 +210,7 @@ static bool initializeSky() {
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &skyConstants));
+    // Alpha-blend colour only; leave destination alpha untouched.
     D3D11_BLEND_DESC blend{};
     auto &r = blend.RenderTarget[0];
     r.BlendEnable = TRUE;
@@ -163,6 +221,7 @@ static bool initializeSky() {
     r.DestBlendAlpha = D3D11_BLEND_ONE;
     r.BlendOpAlpha = D3D11_BLEND_OP_ADD;
     r.RenderTargetWriteMask = 7;
+    // Depth-test (no write) so terrain and clouds hide the moon.
     D3D11_DEPTH_STENCIL_DESC depth{};
     depth.DepthEnable = TRUE;
     depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
@@ -179,8 +238,12 @@ static bool initializeSky() {
            : "Moon disk resources unavailable; lighting remains enabled.");
     return ok;
 }
+
+// Projects the moon direction with the captured camera. disk = (x, y, radius,
+// alpha) in pixels; false when the moon is behind the camera or off-screen.
 static bool moonDiskPosition(float disk[4], MoonState phase) {
     float v[4]{}, clip[4]{};
+    // Rotate (not translate) by the view matrix: the moon is infinitely far away.
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++)
             v[r] += sceneView[r * 4 + c] * phase.direction[c];
@@ -198,6 +261,9 @@ static bool moonDiskPosition(float disk[4], MoonState phase) {
     disk[3] = phase.weight * .75f;
     return true;
 }
+
+// Draws the moon once per frame into the captured scene target (if it is night
+// and the moon is on screen), then releases the captured views.
 static void renderSky() {
     if (internal || !skyReady || skyFinished)
         return;
@@ -232,6 +298,12 @@ static void renderSky() {
     internal = false;
     clearSky();
 }
+
+// ===========================================================================
+// Night lighting
+// ===========================================================================
+
+// Creates our replacement constant buffers on first use (for context `c`).
 static bool initialize(ID3D11DeviceContext *c) {
     if (device)
         return context == c && light && ambient && material && white;
@@ -251,10 +323,33 @@ static bool initialize(ID3D11DeviceContext *c) {
            : "Moon lighting buffer creation failed.");
     return ok;
 }
+
+// The native constant buffers of a draw and which slots we replaced.
 struct Saved {
-    ID3D11Buffer *b[9]{};
-    bool changed[9]{};
+    ID3D11Buffer *b[NATIVE_CB_COUNT]{};
+    bool changed[NATIVE_CB_COUNT]{};
 };
+
+// On the first world draw of the frame, remember the scene target, depth and
+// camera for the moon disk.
+static void captureSkyTarget(ID3D11DeviceContext *c, ID3D11Buffer *viewBuffer,
+                             const float *projection) {
+    if (!read(viewBuffer, sceneView, 64) ||
+        !(fabsf(sceneView[3]) + fabsf(sceneView[7]) + fabsf(sceneView[11]) > .01f))
+        return;
+    UINT count = 1;
+    c->RSGetViewports(&count, &skyViewport);
+    if (count && skyViewport.Width >= 640 && skyViewport.Height >= 360 &&
+        skyViewport.TopLeftX == 0 && skyViewport.TopLeftY == 0) {
+        memcpy(sceneProjection, projection, 64);
+        c->OMGetRenderTargets(1, &skyTarget, &sceneDepth);
+        skyReady = skyTarget && sceneDepth;
+    }
+}
+
+// Runs before every draw. At night, binds moonlit copies of the native light and
+// ambient buffers (and dimmed cloud material); the first HUD draw triggers the
+// moon disk. Returns what restore() must undo.
 static Saved prepare(ID3D11DeviceContext *c) {
     Saved saved;
     if (internal || !enabled || c->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
@@ -262,7 +357,7 @@ static Saved prepare(ID3D11DeviceContext *c) {
     auto phase = current();
     if (phase.weight <= 0)
         return saved;
-    c->VSGetConstantBuffers(0, 9, saved.b);
+    c->VSGetConstantBuffers(0, NATIVE_CB_COUNT, saved.b);
     const UINT sizes[] = {64, 64, 64, 16, 320, 48, 16, 16, 16};
     bool native = true;
     for (int i = 0; i < 9; i++) {
@@ -273,8 +368,9 @@ static Saved prepare(ID3D11DeviceContext *c) {
             native = false;
     }
     float projection[16]{};
-    bool gotProjection = read(saved.b[0], projection, 64);
+    bool gotProjection = read(saved.b[CB_PROJECTION], projection, 64);
     if (gotProjection && fabsf(projection[15]) > .5f) {
+        // Orthographic: the HUD has started, so the 3D scene is complete.
         renderSky();
         return saved;
     }
@@ -290,49 +386,46 @@ static Saved prepare(ID3D11DeviceContext *c) {
     isCloud = testCloud;
 #endif
     float nativeLight[12]{}, a[4]{}, m[4]{}, w[4]{};
-    if (!read(saved.b[5], nativeLight, 48) || !read(saved.b[6], a, 16) || !initialize(c))
+    if (!read(saved.b[CB_LIGHT], nativeLight, 48) || !read(saved.b[CB_AMBIENT], a, 16) ||
+        !initialize(c))
         return saved;
     sunX = nativeLight[8];
     sunY = nativeLight[9];
     sunZ = nativeLight[10];
     sunKnown = true;
     phase = current();
-    if (!skyFinished && !skyReady && !isCloud && read(saved.b[1], sceneView, 64) &&
-        fabsf(sceneView[3]) + fabsf(sceneView[7]) + fabsf(sceneView[11]) > .01f) {
-        UINT count = 1;
-        c->RSGetViewports(&count, &skyViewport);
-        if (count && skyViewport.Width >= 640 && skyViewport.Height >= 360 &&
-            skyViewport.TopLeftX == 0 && skyViewport.TopLeftY == 0) {
-            memcpy(sceneProjection, projection, 64);
-            c->OMGetRenderTargets(1, &skyTarget, &sceneDepth);
-            skyReady = skyTarget && sceneDepth;
-        }
-    }
+    if (!skyFinished && !skyReady && !isCloud)
+        captureSkyTarget(c, saved.b[CB_VIEW], projection);
     internal = true;
+    // Moonlit light colours and direction.
     float changed[12];
     moonrules::lighting(changed, nativeLight, phase, amount);
     upload(c, light, changed, 48);
-    c->VSSetConstantBuffers(5, 1, &light);
-    saved.changed[5] = true;
+    c->VSSetConstantBuffers(CB_LIGHT, 1, &light);
+    saved.changed[CB_LIGHT] = true;
+    // Slightly blue ambient.
     const float tint[] = {.075f, .09f, .12f};
     for (int i = 0; i < 3; i++)
         a[i] = std::clamp(a[i] + tint[i] * phase.weight * amount, 0.f, 1.f);
     upload(c, ambient, a, 16);
-    c->VSSetConstantBuffers(6, 1, &ambient);
-    saved.changed[6] = true;
-    if (isCloud && read(saved.b[3], m, 16) && read(saved.b[7], w, 16)) {
+    c->VSSetConstantBuffers(CB_AMBIENT, 1, &ambient);
+    saved.changed[CB_AMBIENT] = true;
+    // Darker, cooler clouds.
+    if (isCloud && read(saved.b[CB_MATERIAL], m, 16) && read(saved.b[CB_WHITE], w, 16)) {
         float result[4];
         moonrules::cloud(result, m, phase.weight, cloudScale);
         upload(c, material, result, 16);
         w[0] *= 1 - phase.weight;
         upload(c, white, w, 16);
-        c->VSSetConstantBuffers(3, 1, &material);
-        c->VSSetConstantBuffers(7, 1, &white);
-        saved.changed[3] = saved.changed[7] = true;
+        c->VSSetConstantBuffers(CB_MATERIAL, 1, &material);
+        c->VSSetConstantBuffers(CB_WHITE, 1, &white);
+        saved.changed[CB_MATERIAL] = saved.changed[CB_WHITE] = true;
     }
     internal = false;
     return saved;
 }
+
+// Rebinds the native buffers that prepare() replaced and releases the references.
 static void restore(ID3D11DeviceContext *c, Saved &s) {
     for (int i = 0; i < 9; i++) {
         if (s.changed[i])
@@ -340,6 +433,11 @@ static void restore(ID3D11DeviceContext *c, Saved &s) {
         drop(s.b[i]);
     }
 }
+
+// ===========================================================================
+// Hooks
+// ===========================================================================
+
 static void STDMETHODCALLTYPE di(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     auto saved = prepare(c);
     oldDI(c, n, s, b);
@@ -350,6 +448,7 @@ static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
     oldD(c, n, s);
     restore(c, saved);
 }
+// Map/Unmap/Update: remember writes to small constant buffers.
 static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub,
                                      D3D11_MAP t, UINT flags, D3D11_MAPPED_SUBRESOURCE *m) {
     auto hr = oldMap(c, r, sub, t, flags, m);
@@ -386,14 +485,8 @@ static bool patch(void **slot, void *fn) {
     VirtualProtect(slot, sizeof(void *), old, &unused);
     return true;
 }
-static DWORD attach() {
-    if (table)
-        return 1;
-    if (!nativeScene::supported()) {
-        log("Unsupported game build; disabled.");
-        enabled = false;
-        return 0;
-    }
+
+static void loadSettings() {
     auto setting = [](const wchar_t *key, int value) {
         return GetPrivateProfileIntW(L"Moon", key, value, L".\\Mods\\MoonLight.ini");
     };
@@ -402,6 +495,20 @@ static DWORD attach() {
     cloudScale = std::clamp((int)setting(L"NightCloudBrightnessPercent", 55), 20, 100) * .01f;
     shadowStrength = std::clamp((int)setting(L"ShadowStrengthPercent", 20), 0, 100) * .01f;
     visibleMoon = setting(L"VisibleMoon", 1) != 0;
+}
+
+// Reads the settings and hooks the shared ID3D11DeviceContext vtable (taken
+// from a temporary device). All hooks are installed or none are. Returns 1 on
+// success (or when disabled), 0 on failure.
+static DWORD attach() {
+    if (table)
+        return 1;
+    if (!nativeScene::supported()) {
+        log("Unsupported game build; disabled.");
+        enabled = false;
+        return 0;
+    }
+    loadSettings();
     if (!enabled)
         return 1;
     ID3D11Device *d = nullptr;
@@ -415,11 +522,11 @@ static DWORD attach() {
         void *fn;
         void **old;
     };
-    Hook hooks[] = {{12, (void *)di, (void **)&oldDI},
-                    {13, (void *)draw, (void **)&oldD},
-                    {14, (void *)map, (void **)&oldMap},
-                    {15, (void *)unmap, (void **)&oldUnmap},
-                    {48, (void *)update, (void **)&oldUpdate}};
+    Hook hooks[] = {{SLOT_DRAW_INDEXED, (void *)di, (void **)&oldDI},
+                    {SLOT_DRAW, (void *)draw, (void **)&oldD},
+                    {SLOT_MAP, (void *)map, (void **)&oldMap},
+                    {SLOT_UNMAP, (void *)unmap, (void **)&oldUnmap},
+                    {SLOT_UPDATE_SUBRESOURCE, (void *)update, (void **)&oldUpdate}};
     for (auto &h : hooks)
         *h.old = v[h.slot];
     bool ok = true;
@@ -444,6 +551,11 @@ static DWORD attach() {
     return ok ? 1 : 0;
 }
 } // namespace moonlight
+
+// ===========================================================================
+// Entry points (standalone MoonLight build; MoonandShadow.cpp has its own)
+// ===========================================================================
+
 #ifndef MOON_AND_SHADOW
 class MoonLight : public GenericMod {
   public:
@@ -468,6 +580,7 @@ EXPORT int ModMinorVersion() {
     return 3;
 }
 #endif
+// Current moon state for other mods; returns TRUE while the moon is up.
 extern "C" __declspec(dllexport) BOOL WINAPI QueryMoonLight(MoonState *out) {
     if (!out)
         return FALSE;
