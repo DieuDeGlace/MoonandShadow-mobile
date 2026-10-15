@@ -59,3 +59,13 @@ The new diagnostic logs one receiver workload line every 600 shadow frames: vert
 `MobileBuild.h` and the phone-only identity check are kept. The phone's own `SteamShadows.ini`/`MoonLight.ini` are never overwritten by the installer.
 
 All 9 tests pass, and NativeClipTest shows 0 mismatches against the local executable.
+
+## Inline terrain shadows (2026-10-15)
+
+Merged upstream `perf/inline-terrain-shadows`. Terrain now gets its shadow inside the native draw, so the receiver pass no longer redraws terrain. It does this with exact HLSL copies of Steam's world shaders, recognised by DXBC checksum when the game creates them. Models keep the receiver pass.
+
+The phone runs the same Steam executable, so the native shaders and checksums are identical.
+
+`InlineTerrain=0` in the phone's `SteamShadows.ini` restores the receiver pass for terrain. NativeEquivalenceTest, InlineTerrainTest and NativeClipTest all pass against the local executable.
+
+Not yet measured: DXVK and phone GPU cost.
