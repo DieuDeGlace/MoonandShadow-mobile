@@ -44,3 +44,10 @@ Installed into the actual GameNative Steam folder with a rollback installer; thr
 Rollback: close GameNative and restore all three backed-up DLLs together. Keep the existing INIs. The normal Steam-folder launcher was restored after the one-time installer. Geo/.NET, saves, Steam auth, driver/DXVK/Proton and other installed mods were not replaced.
 
 For all rendering tests: build-mobile.cmd --gpu followed by an optional quoted path to your supported cubeworld.exe. NativeClipTest skips with exit 77 if the exact private fixture is absent; no game shader binaries are distributed.
+
+## Desktop shadow fixes merged (2026-10-13)
+Merged upstream main at 7880a89: vanilla shadow darkness (#3), camera-distance fade (#4), smooth dusk/dawn (#5), shadow pass overhead reductions (#7), and terrain noon banding plus daytime shadows from the game's own light direction (#9). NativeScene keeps the mobile executable identity (MobileBuild.h, SizeOfImage 0x58a000), now expressed through upstream's SUPPORTED_* constants. Validation is cached once; the game pointer is read on every query.
+
+The mobile75 preset keeps its values and adds `CameraFade=1` and `SunFromGame=1`, which are also the defaults. Note that #3 changed what `StrengthPercent` means: it is now the share of the game's direct sunlight a shadow removes, and 100 matches a face turned away from the sun. The preset's 45 therefore gives lighter shadows than the PC default of 100. 75 would match the preset's original "75% of PC" intent.
+
+All nine CTest suites pass with the mobile identity (WARP and local hardware). Device testing on GameNative is still needed.

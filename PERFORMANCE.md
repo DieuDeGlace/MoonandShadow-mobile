@@ -29,3 +29,14 @@ Nine tests cover moon rules/rendering, resource setup, terrain filtering, cloud 
 The model-plane sweep includes five face orientations above, inside, and below the grazing transition: 160 near/far, orientation, occluder-gap, slope-sign, and subtexel-phase cases. Unoccluded surfaces follow a uniform continuous angular exposure; occluders retain directional occlusion. This specifically tests that changing subtexel phase does not recreate bands around the noon shading rule.
 
 NativeClipTest reads the supported Steam executable's shader locally at runtime, without including it in the repository. It compares 4,608 clip components across 24 mirrored/nonuniform poses and native depth offsets, and checks transformed normals. The verified fixture matches clip positions bit for bit. Users without that exact executable receive a skipped test (exit 77); an executable path can be supplied as its first argument. These tests validate specific rendering invariants, not Omega visual parity or measured FPS.
+
+## Overhead reductions
+
+These changes do not alter the image. The 3072/2048 maps, filtering, camera/dusk fades, mesh-replay placement, TAA and WorldMotion are unchanged.
+
+- Replay constants use a dynamic buffer with `WRITE_DISCARD` instead of `UpdateSubresource`. The receiver and caster passes upload once per draw. Updating a default-usage buffer the GPU is still reading makes the driver copy it and order each draw.
+- Receivers whose world bounds lie wholly beyond the shadow radius are not replayed. The test uses ground distance, plus height when CameraFade is on. The pixel shader already returns "unchanged" for fully faded pixels.
+- Model casters are culled against each map's light-space bounds. Terrain now uses this test for the far map too, not only the near map.
+- In the combined mod, one Map/Unmap/Update hook layer (MoonLight's) mirrors native constants into one shared cache. Previously two layers each stored every write. Buffers are classified with `GetType` instead of `QueryInterface`.
+- Replayed draws go straight past MoonLight's per-draw hook, which never applies to this pass's own constants. MoonLight computes its moon state once per game-clock value instead of per draw. The supported-executable check is cached.
+- `SteamShadows.log` reports captured/receiver/model-caster counts. Every minute it also logs the capture hook's CPU time per frame, sampled every 60th frame.

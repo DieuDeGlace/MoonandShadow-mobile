@@ -24,17 +24,23 @@ Close Steam Cube World, remove MoonLight.dll and SteamShadows.dll from Mods, and
 
 Supports the inspected Steam executable (PE timestamp 0x5d93ab0d, image size 0x5b7000); Alpha and Omega executables are unsupported. Moon and sun share one shadow map. GPU tests check rendering resources, filtering, cloud casting and moon rendering; they do not guarantee FPS or visual correctness in every location.
 
+## Shadow darkness
+
+Shadows match the unmodified game's own dark side. Every shadowed surface (terrain and models) loses only the direct-sunlight part of the game's lighting, using the same formula as the native world vertex shader. With `StrengthPercent=100` (the default), a sunlit surface in shadow is exactly as dark as a block face turned away from the sun; ambient, back and lantern/point light are kept, so the darkness follows the game's own day/night lighting. Lower values remove only that share of the sunlight.
+
+Shadows keep full strength while the sun or moon is more than about 17.5° above the horizon and fade out below that. Within about 4.6° of the horizon (roughly 17:42–18:18 and 05:42–06:18 game time) there are no shadows at all, so the switch between sun and moon happens while nothing is drawn, and shadows fade back in as the new light rises. MoonLight also turns the native light direction gradually towards the moon as it fades in and out, instead of jumping at 18:00 and 06:00.
+
 ## Appearance and fade
 
 Palette/desaturation now lives in [alpha-lookalike](https://github.com/DieuDeGlace/alpha-lookalike), a separate loader DLL. MoonandShadow applies no fullscreen color grade. Install alpha-lookalike only if wanted. ReShade remains untouched. The optional FinishWorldLighting export allows the palette to finish moon/shadow rendering before grading regardless of hook installation order.
 
-SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth directional-shadow fade at 40% of Radius and reaches zero at Radius (48–120 blocks with Radius=120). This is a reference-inspired distance fade, not a change to shadow-map blur. The shadow map is now 4096 in the supplied preset; this fade adds no map or pass.
+SunWarmthPercent=3 retains the small warm sunlit contribution in the existing shadow receiver. FadeStartPercent=40 starts a smooth shadow fade at 40% of Radius and reaches zero at Radius. With CameraFade=1 (default) that distance is measured from the camera, as in Omega: zooming out shortens how far shadows reach and, fully zoomed out, removes them around the player. CameraFade=0 restores the older ground-distance fade, which ignores zoom. The supplied preset (Resolution=3072, Radius=70) fades shadows between 28 and 70 blocks from the camera; Radius also sets how much ground the shadow map covers. Pixels past the fade skip their shadow-map samples, so zoomed-out views cost less GPU time.
 
 Lantern correction retains native illumination and suppresses added directional darkening near the player over the existing 12-block radius. No local-light shadow maps or occlusion tracing are added. Five moon/shadow tests pass; gameplay appearance and performance require live verification.
 
 ## 120-block shadow update
 
-The default map is 4096×4096 with Radius=120. D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
+The code default (no INI) is a 4096×4096 map with Radius=120; the supplied preset uses 3072 with Radius=70, which is slightly sharper per block (about 22 texels per block versus 17). D32 shadow storage rises from 36 MiB (3072) to 64 MiB; the map has about 1.78 times as many texels. Higher resolution reduces shadow-map stair stepping while retaining the inexpensive hardware comparison filter. It does not eliminate voxel geometry steps or all screen aliasing. Larger caster coverage can cost more GPU time; FPS needs live verification.
 
 The receiver no longer rejects faces pointing sideways/away from the directional light or fades their shadows based on face angle. All six voxel normals now receive occluder shadows; angle remains relevant to sunlight warmth and local lights. Grazing-face depth bias is bounded more tightly to avoid withdrawing shadows from block sides. Existing lantern protection and distance fade are retained.
 
