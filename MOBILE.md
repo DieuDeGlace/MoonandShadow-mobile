@@ -45,27 +45,9 @@ Rollback: close GameNative and restore all three backed-up DLLs together. Keep t
 
 For all rendering tests: build-mobile.cmd --gpu followed by an optional quoted path to your supported cubeworld.exe. NativeClipTest skips with exit 77 if the exact private fixture is absent; no game shader binaries are distributed.
 
-## PC sync and receiver diagnostics (2026-10-15)
+## Desktop shadow fixes merged (2026-10-13)
+Merged upstream main at 7880a89: vanilla shadow darkness (#3), camera-distance fade (#4), smooth dusk/dawn (#5), shadow pass overhead reductions (#7), and terrain noon banding plus daytime shadows from the game's own light direction (#9). NativeScene keeps the mobile executable identity (MobileBuild.h, SizeOfImage 0x58a000), now expressed through upstream's SUPPORTED_* constants. Validation is cached once; the game pointer is read on every query.
 
-Merged upstream MoonandShadow `perf/shadow-receiver-diagnostics`, which includes PC main through 7880a89. That brings:
+The mobile75 preset keeps its values and adds `CameraFade=1` and `SunFromGame=1`, which are also the defaults. Note that #3 changed what `StrengthPercent` means: it is now the share of the game's direct sunlight a shadow removes, and 100 matches a face turned away from the sun. The preset's 45 therefore gives lighter shadows than the PC default of 100. 75 would match the preset's original "75% of PC" intent.
 
-- the shadow overhead reductions and camera-distance fade;
-- dusk/dawn fading;
-- the noon terrain banding fix;
-- daytime shadows cast from the game's own light direction.
-
-The new diagnostic logs one receiver workload line every 600 shadow frames: vertex/pixel invocations, triangles, terrain/model receiver counts and active point lights. It uses a non-blocking pipeline-statistics query and does not change the image.
-
-`MobileBuild.h` and the phone-only identity check are kept. The phone's own `SteamShadows.ini`/`MoonLight.ini` are never overwritten by the installer.
-
-All 9 tests pass, and NativeClipTest shows 0 mismatches against the local executable.
-
-## Inline terrain shadows (2026-10-15)
-
-Merged upstream `perf/inline-terrain-shadows`. Terrain now gets its shadow inside the native draw, so the receiver pass no longer redraws terrain. It does this with exact HLSL copies of Steam's world shaders, recognised by DXBC checksum when the game creates them. Models keep the receiver pass.
-
-The phone runs the same Steam executable, so the native shaders and checksums are identical.
-
-`InlineTerrain=0` in the phone's `SteamShadows.ini` restores the receiver pass for terrain. NativeEquivalenceTest, InlineTerrainTest and NativeClipTest all pass against the local executable.
-
-Not yet measured: DXVK and phone GPU cost.
+All nine CTest suites pass with the mobile identity (WARP and local hardware). Device testing on GameNative is still needed.

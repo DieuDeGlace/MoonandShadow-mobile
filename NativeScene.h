@@ -1,4 +1,6 @@
 #pragma once
+// Shared helpers for reading Cube World (Steam, 64-bit) scene data through the
+// CWSDK headers. The same file is used by every Steam mod in this collection.
 #include "MobileBuild.h"
 #include "cube/Game.h"
 #include "gfx/ChunkBuffer.h"
@@ -6,16 +8,26 @@
 #include <unordered_map>
 #include <cmath>
 namespace nativeScene {
+
+// Identity of the one supported cubeworld.exe build: the executable used by
+// this GameNative setup (see MobileBuild.h). Unsupported builds must not use
+// native RVAs.
+constexpr DWORD SUPPORTED_TIMESTAMP = mobileBuild::timestamp;
+constexpr DWORD SUPPORTED_IMAGE_SIZE = mobileBuild::imageSize;
+// RVA of the global cube::Game pointer in that build.
+constexpr size_t GAME_POINTER_RVA = mobileBuild::gamePointerRva;
 // Offset of a chunk buffer's vertical chunk index (not described by CWSDK).
 constexpr size_t CHUNK_BUFFER_Z = 0x5c;
-// The executable is immutable during a process. Validate its identity once,
-// rather than repeating PE-header inspection in scene/terrain queries.
+
+// The executable is immutable during a process.
 inline unsigned char *executableBase() {
     static auto *base = reinterpret_cast<unsigned char *>(GetModuleHandleW(nullptr));
     return base;
 }
+// True when running inside the exact executable these offsets were verified for.
+// Called from every draw hook; validated once.
 inline bool supported() {
-    static const bool matchesMobileBuild = [] {
+    static const bool result = [] {
         const auto *base = executableBase();
         if (!base)
             return false;
@@ -24,17 +36,16 @@ inline bool supported() {
             return false;
         const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
         return nt->Signature == IMAGE_NT_SIGNATURE &&
-               nt->FileHeader.TimeDateStamp == mobileBuild::timestamp &&
-               nt->OptionalHeader.SizeOfImage == mobileBuild::imageSize;
+               nt->FileHeader.TimeDateStamp == SUPPORTED_TIMESTAMP &&
+               nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE;
     }();
-    return matchesMobileBuild;
+    return result;
 }
-// The game object, or nullptr on an unsupported build.
+// The game object, or nullptr on an unsupported build. Read each time; it may
+// change when a world reloads.
 inline cube::Game *game() {
-    // Read the game pointer each time; it may change when a world reloads.
-    return supported()
-               ? *reinterpret_cast<cube::Game **>(executableBase() + mobileBuild::gamePointerRva)
-               : nullptr;
+    return supported() ? *reinterpret_cast<cube::Game **>(executableBase() + GAME_POINTER_RVA)
+                       : nullptr;
 }
 // True when `buffer` is the vertex buffer of the cloud or dark-cloud sprite.
 inline bool cloud(cube::World *world, ID3D11Buffer *buffer) {
@@ -52,28 +63,6 @@ inline bool cloud(cube::World *world, ID3D11Buffer *buffer) {
             return true;
     }
     return false;
-}
-
-// 1 when `buffer` is the native lily-pad sprite, 2 for the lily flower, else 0.
-// WaterLilies places many of these on freshwater; the slots and model sizes
-// are the ones it verifies before placing them.
-inline int lily(cube::World *world, ID3D11Buffer *buffer) {
-    if (!world || !world->spritemanager || !buffer)
-        return 0;
-    const auto &sprites = world->spritemanager->sprites;
-    constexpr size_t flowerSprite = 0xd23, padSprite = 0xd24;
-    for (size_t index : {padSprite, flowerSprite}) {
-        if (index >= sprites.size())
-            continue;
-        auto s = sprites[index];
-        bool flower = index == flowerSprite;
-        if (s && s->lowering_this_makes_plants_go_fast == 4 &&
-            s->something_with_offset_1 == (flower ? 13 : 9) &&
-            s->something_with_offset_2 == (flower ? 14 : 9) && s->gfx_D3D11VertexBuffer &&
-            s->gfx_D3D11VertexBuffer->buffer == buffer)
-            return flower ? 2 : 1;
-    }
-    return 0;
 }
 
 // Where a terrain chunk buffer lives: its zone and vertical chunk index.
