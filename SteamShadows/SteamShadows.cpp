@@ -23,6 +23,7 @@
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
 #include "../GpuPassTimer.h"
+#include "../BufferLayout.h"
 #include "InlineTerrain.h"
 #include <unordered_set>
 #include <vector>
@@ -232,11 +233,15 @@ static void clearClouds() {
     frameOriginKnown = false;
 }
 // Current cloud drift applied by WorldMotion.dll (zero without it).
+// Companion-mod exports are looked up once: all mods are loaded before the game
+// renders.
+static FARPROC companion(const wchar_t *dll, const char *name) {
+    auto module = GetModuleHandleW(dll);
+    return module ? GetProcAddress(module, name) : nullptr;
+}
 static void cloudDrift(float out[2]) {
     out[0] = out[1] = 0;
-    auto module = GetModuleHandleW(L"WorldMotion.dll");
-    auto query =
-        module ? (BOOL(WINAPI *)(float *))GetProcAddress(module, "QueryCloudDrift") : nullptr;
+    static auto query = (BOOL(WINAPI *)(float *))companion(L"WorldMotion.dll", "QueryCloudDrift");
     if (query)
         query(out);
 }
@@ -435,12 +440,11 @@ static Vec lastClockSun{0, 0, 1}; // Clock-driven direction, for the diagnostic 
 
 // MoonLight's current state, if MoonandShadow/MoonLight is loaded and the moon is up.
 static bool queryMoon(MoonState &moon) {
-    auto moonModule = GetModuleHandleW(L"MoonandShadow.dll");
-    if (!moonModule)
-        moonModule = GetModuleHandleW(L"MoonLight.dll");
-    auto query = moonModule
-                     ? (BOOL(WINAPI *)(MoonState *))GetProcAddress(moonModule, "QueryMoonLight")
-                     : nullptr;
+    using Query = BOOL(WINAPI *)(MoonState *);
+    static auto query = [] {
+        auto found = (Query)companion(L"MoonandShadow.dll", "QueryMoonLight");
+        return found ? found : (Query)companion(L"MoonLight.dll", "QueryMoonLight");
+    }();
     return query && query(&moon) && moon.version == 1;
 }
 
@@ -1713,17 +1717,33 @@ static bool recordCloud(ID3D11DeviceContext *c, cube::World *world, UINT count, 
 }
 
 // Native world draws bind six vertex constant buffers of these sizes.
+static BufferLayout<6> worldLayout;
 static bool nativeWorldBuffers(ID3D11Buffer *const buffers[6]) {
-    UINT expected[] = {64, 64, 64, 16, 320, 48};
-    bool world = true;
-    for (int i = 0; i < 6; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (buffers[i])
-            buffers[i]->GetDesc(&d);
-        if (d.ByteWidth != expected[i])
-            world = false;
+    static const UINT expected[6] = {64, 64, 64, 16, 320, 48};
+    return worldLayout.matches(buffers, expected);
+}
+// Whether the bound blend state blends render target 0. Blend descriptions are
+// immutable; the last state is retained and its answer reused.
+static bool blendsTarget(ID3D11DeviceContext *c) {
+    static ID3D11BlendState *last = nullptr;
+    static bool lastBlends = false, known = false;
+    ID3D11BlendState *bs = nullptr;
+    float factor[4];
+    UINT mask;
+    c->OMGetBlendState(&bs, factor, &mask);
+    if (!known || bs != last) {
+        D3D11_BLEND_DESC bd{};
+        if (bs)
+            bs->GetDesc(&bd);
+        if (bs)
+            bs->AddRef();
+        drop(last);
+        last = bs;
+        lastBlends = bd.RenderTarget[0].BlendEnable != FALSE;
+        known = true;
     }
-    return world;
+    drop(bs);
+    return lastBlends;
 }
 
 // Called before every native draw. Records opaque world draws as shadow
@@ -1803,16 +1823,7 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         log(s);
     }
     // Blended (transparent) draws are not shadow receivers.
-    ID3D11BlendState *bs = nullptr;
-    float factor[4];
-    UINT mask;
-    c->OMGetBlendState(&bs, factor, &mask);
-    D3D11_BLEND_DESC bd{};
-    if (bs) {
-        bs->GetDesc(&bd);
-        drop(bs);
-    }
-    if (bd.RenderTarget[0].BlendEnable) {
+    if (blendsTarget(c)) {
         if (captureRequest.load() && diagnosticRejects++ < 8)
             log("Skipped blended scene draw.");
         return false;
@@ -2120,10 +2131,8 @@ static void STDMETHODCALLTYPE clear(ID3D11DeviceContext *c, ID3D11DepthStencilVi
         clearDraws();
         finished = false;
         inlineFrame.uploaded = false;
-        auto motionModule = GetModuleHandleW(L"WorldMotion.dll");
-        auto beginMotion =
-            motionModule ? (void(WINAPI *)())GetProcAddress(motionModule, "BeginWorldMotionFrame")
-                         : nullptr;
+        static auto beginMotion =
+            (void(WINAPI *)())companion(L"WorldMotion.dll", "BeginWorldMotionFrame");
         if (beginMotion)
             beginMotion();
         if (toggleRequest.exchange(0) || GetAsyncKeyState(VK_F7) & 1) {
