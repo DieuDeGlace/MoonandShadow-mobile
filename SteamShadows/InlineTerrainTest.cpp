@@ -189,10 +189,17 @@ int main(int argc, char **argv) {
     p.cascade[0] = 1.f / nearResolution, p.cascade[1] = 300, p.cascade[2] = 240;
 
     // mode 0: native only, 1: native + receiver pass (previous path), 2: inline.
-    auto run = [&](int mode, int shine, float originShift) -> std::vector<unsigned char> {
+    // A static model: the same geometry rotated 30 degrees, scaled and raised.
+    float M[16]{};
+    {
+        float cs = .9f * cosf(.5236f), sn = .9f * sinf(.5236f);
+        M[0] = cs, M[1] = -sn, M[4] = sn, M[5] = cs, M[10] = .9f, M[15] = 1;
+        M[3] = 128 - (cs * 128 - sn * 128), M[7] = 128 - (sn * 128 + cs * 128), M[11] = 15;
+    }
+    auto run = [&](int mode, int shine, float originShift, bool model) -> std::vector<unsigned char> {
         bool inlineDraw = mode == 2;
         float world[16], view[16];
-        memcpy(world, W, 64);
+        memcpy(world, model ? M : W, 64);
         memcpy(view, V, 64);
         // A floating origin moved by `originShift`: world positions shift, the
         // camera compensates, so the image is the same.
@@ -230,7 +237,7 @@ int main(int argc, char **argv) {
         vb->AddRef(), ib->AddRef(), layout->AddRef();
         x.stride = 8, x.count = (UINT)indices.size(), x.format = DXGI_FORMAT_R16_UINT;
         x.topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-        x.terrain = true;
+        x.terrain = !model;
         memcpy(x.world, world, 64), memcpy(x.view, view, 64), memcpy(x.proj, P, 64);
         memcpy(x.light, light, 48), memcpy(x.pointLights, shifted, 320);
         memcpy(x.material, material, 16), memcpy(x.ambient, ambient, 16);
@@ -243,6 +250,8 @@ int main(int argc, char **argv) {
             frameOriginX = inlineFrame.originX + originShift;
             frameOriginY = inlineFrame.originY;
             inlineFrame.uploaded = false;
+            if (model) // it was drawn identically last frame: a static model
+                staticKeysPrevious.insert(staticKey(draws.back(), frameOriginX, frameOriginY));
             assert(drawInlineTerrain(c, x.count, 0, 0));
             assert(draws.back().inlined);
         } else if (mode == 0) {
@@ -279,11 +288,12 @@ int main(int argc, char **argv) {
         return image;
     };
 
+    for (bool model : {false, true})
     for (int shine = 0; shine < 2; ++shine)
         for (float shift : {0.f, 16.f}) {
-            auto native = run(0, shine, 0);
-            auto before = run(1, shine, 0); // also leaves inlineFrame for the next frame
-            auto after = run(2, shine, shift);
+            auto native = run(0, shine, 0, model);
+            auto before = run(1, shine, 0, model); // also leaves inlineFrame for the next frame
+            auto after = run(2, shine, shift, model);
             int worst = 0;
             size_t shadowed = 0, bad = 0, reported = 0;
             for (size_t i = 0; i < before.size(); i += 4) {
@@ -304,9 +314,10 @@ int main(int argc, char **argv) {
                 bad += diff > 2;
             }
             printf("  pixels differing by more than 2/255: %zu\n", bad);
-            printf("%s, origin shift %.0f: %zu pixels changed by the shadow, inline vs receiver "
+            printf("%s %s, origin shift %.0f: %zu pixels changed by the shadow, inline vs receiver "
                    "max difference %d/255\n",
-                   shine ? "shine" : "plain", shift, shadowed, worst);
+                   model ? "static model" : "terrain", shine ? "shine" : "plain", shift, shadowed,
+                   worst);
             assert(shadowed > size * size / 20); // the shadow really shades part of the image
             assert(worst <= 2);
         }

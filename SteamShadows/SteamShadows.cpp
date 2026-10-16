@@ -24,6 +24,7 @@
 #include <d3d11shader.h>
 #include "../GpuPassTimer.h"
 #include "InlineTerrain.h"
+#include <unordered_set>
 #include <vector>
 #include <unordered_map>
 #include <cmath>
@@ -92,6 +93,26 @@ static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
 static ID3D11VertexShader *modelReceiver = nullptr;
 static ID3D11PixelShader *terrainVisibility = nullptr;
 static ID3D11Buffer *constants = nullptr;
+// Inline terrain shadows (InlineTerrain.h): Steam's world shaders re-expressed
+// with the shadow term applied in place, used for native terrain draws while
+// the previous frame's shadow maps are valid. The receiver pass then skips them.
+static bool inlineTerrainEnabled = true;
+static ID3D11VertexShader *inlineVS = nullptr;
+static ID3D11PixelShader *inlinePS[2] = {}; // [0] plain 0x43b500, [1] shine 0x438810
+// Static models (same mesh and absolute transform as last frame) get the same
+// treatment with the model shadow filter; moving models keep the receiver pass
+// so their self-shadows stay current-frame.
+static ID3D11PixelShader *inlineModelPS[2] = {};
+static ID3D11Buffer *inlineConstants = nullptr, *inlineShift = nullptr,
+                    *inlineModelConstants = nullptr;
+static bool inlineModelsEnabled = true;
+static std::unordered_set<uint64_t> staticKeysPrevious, staticKeysCurrent;
+static unsigned inlineModelDraws = 0;
+static unsigned inlineDraws = 0, inlineFrames = 0;
+// Native shaders are recognised by their DXBC checksum when the game creates
+// them, and tagged with this private data (1 world VS, 2 plain PS, 3 shine PS).
+static const GUID nativeShaderGuid = {
+    0x5e0f2a61, 0x8a43, 0x4a7d, {0x9f, 0x31, 0x6c, 0x0b, 0x52, 0xd8, 0x4e, 0x17}};
 // Caster input layouts for native (UBYTE4) and animated (float4) terrain vertices.
 static ID3D11InputLayout *nativeCasterLayout = nullptr, *floatCasterLayout = nullptr;
 // Near shadow cascade: a sharper map covering `nearRadius` around the camera.
@@ -269,7 +290,8 @@ static std::vector<TerrainMesh> terrainMeshes;
 static nativeScene::Chunks loadedChunks; // Native vertex buffer -> chunk.
 static cube::World *terrainWorld = nullptr;
 static ULONGLONG terrainRefresh = 0;
-static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0;
+static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, lastInline = 0,
+            lastInlineModels = 0;
 static void clearTerrain() {
     for (auto &m : terrainMeshes) {
         drop(m.vb);
@@ -565,7 +587,13 @@ static void compactPointLights(Params &params) {
 // (front colour + material alpha, back colour, ambient, direction + light
 // protection).
 static const char *hlsl = R"HLSL(
-cbuffer Params:register(b0){row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;row_major float4x4 nearLight;float4 cascade,modelFront,modelBack,modelAmbient,modelDirection;};
+// Inline terrain shaders keep Steam's own cbuffers in b0-b9 (see InlineTerrain.h).
+#ifdef INLINE_TERRAIN
+cbuffer Params:register(b12){
+#else
+cbuffer Params:register(b0){
+#endif
+row_major float4x4 world,view,proj,light;float4 config,eye,sun;float4 pointPositions[10],pointColors[10],lantern,sunTone,depthAdjust;row_major float4x4 nearLight;float4 cascade,modelFront,modelBack,modelAmbient,modelDirection;};
 struct V{
     float4 p:SV_POSITION;
     float3 w:TEXCOORD0;
@@ -890,6 +918,60 @@ static bool initialize(ID3D11DeviceContext *context) {
     cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (ok)
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
+    if (ok && inlineTerrainEnabled) {
+        // Inline terrain is optional: any failure keeps the receiver pass for terrain.
+        bool inlineOk = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineConstants)) &&
+                        SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineModelConstants));
+        D3D11_BUFFER_DESC shift = cb;
+        shift.ByteWidth = 16;
+        inlineOk = inlineOk && SUCCEEDED(device->CreateBuffer(&shift, nullptr, &inlineShift));
+        std::string source = std::string(hlsl) + inlineTerrain::hlsl;
+        for (int i = 0; i < 5 && inlineOk; ++i) {
+            bool model = i >= 3;
+            const D3D_SHADER_MACRO vsMacros[] = {{"MODEL_DIRECT_LIGHT", "1"},
+                                                 {"INLINE_TERRAIN", "1"},
+                                                 {"INLINE_VS", "1"},
+                                                 {nullptr, nullptr}};
+            const D3D_SHADER_MACRO psMacros[] = {{"MODEL_DIRECT_LIGHT", "1"},
+                                                 {"INLINE_TERRAIN", "1"},
+                                                 {"INLINE_PS", "1"},
+                                                 {"INLINE_SHINE", i == 2 || i == 4 ? "1" : "0"},
+                                                 // Models: receiver-plane filter (Gather).
+                                                 {model ? "MODEL_PLANE_FILTER" : "INLINE_UNUSED", "1"},
+                                                 {nullptr, nullptr}};
+            ID3DBlob *code = nullptr, *error = nullptr;
+            HRESULT hr = D3DCompile(source.c_str(), source.size(), "SteamShadowsInline",
+                                    i == 0 ? vsMacros : psMacros, nullptr,
+                                    i == 0 ? "inlineTerrainVertex" : "inlineTerrainPixel",
+                                    i == 0 ? "vs_4_0" : model ? "ps_4_1" : "ps_4_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                                    &code, &error);
+            if (error) {
+                log((char *)error->GetBufferPointer());
+                drop(error);
+            }
+            inlineOk = SUCCEEDED(hr) &&
+                       SUCCEEDED(i == 0 ? device->CreateVertexShader(code->GetBufferPointer(),
+                                                                     code->GetBufferSize(),
+                                                                     nullptr, &inlineVS)
+                                        : device->CreatePixelShader(
+                                              code->GetBufferPointer(), code->GetBufferSize(),
+                                              nullptr, model ? &inlineModelPS[i - 3] : &inlinePS[i - 1]));
+            drop(code);
+        }
+        if (!inlineOk) {
+            drop(inlineVS);
+            drop(inlinePS[0]);
+            drop(inlinePS[1]);
+            drop(inlineModelPS[0]);
+            drop(inlineModelPS[1]);
+            drop(inlineModelConstants);
+            drop(inlineConstants);
+            drop(inlineShift);
+            inlineTerrainEnabled = false;
+            log("Inline terrain shadows unavailable; terrain uses the receiver pass.");
+        }
+    }
     // Shadow map: 32-bit depth, also readable as a float texture.
     D3D11_TEXTURE2D_DESC td{};
     td.Width = td.Height = resolution;
@@ -1112,6 +1194,19 @@ static void uploadParams(const Params &p) {
     else
         ctx->Unmap(constants, 0);
 }
+// Writes `bytes` to a dynamic constant buffer, bypassing our own Map hooks.
+static void uploadTo(ID3D11Buffer *buffer, const void *data, size_t bytes) {
+    D3D11_MAPPED_SUBRESOURCE m{};
+    HRESULT hr = rawMap ? rawMap(ctx, buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)
+                        : ctx->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+    if (FAILED(hr))
+        return;
+    memcpy(m.pData, data, bytes);
+    if (rawUnmap)
+        rawUnmap(ctx, buffer, 0);
+    else
+        ctx->Unmap(buffer, 0);
+}
 // Uploads `p` (with x's world matrix), binds x's geometry and draws it. During
 // our own passes (internal), unchanged state is not re-sent.
 static void bind(const Draw &x, Params &p) {
@@ -1256,7 +1351,7 @@ static void renderTerrainCasters(const Draw &reference, Params &p, bool nearPass
         drop(animated);
     }
     for (auto &x : draws)
-        if (!x.terrain && intersectsMap(x, p)) {
+        if (!x.terrain && !x.lilyPad && intersectsMap(x, p)) {
             bind(x, p);
             ++lastModelCasters;
         }
@@ -1303,7 +1398,7 @@ static void renderCasters(Params &p, unsigned cascade) {
         renderTerrainCasters(*reference, p, nearPass);
     else
         for (auto &x : draws)
-            if (intersectsMap(x, p)) {
+            if (!x.lilyPad && intersectsMap(x, p)) {
                 bind(x, p);
                 ++lastModelCasters;
             }
@@ -1317,7 +1412,46 @@ static void renderCasters(Params &p, unsigned cascade) {
 // shadowed surface matches a face turned away from the sun in the unmodified
 // game; ambient, back and point light are kept. Terrain and models differ only
 // in their pixel shader (models add the receiver-plane filter).
+// Receiver workload diagnostics: every 600th shadow frame, pipeline
+// statistics (vertex/pixel shader invocations) of the receiver pass are read
+// back without waiting and logged with that frame's terrain/model receiver
+// counts and active point lights. They show whether a costly view is vertex-
+// or pixel-bound. One query in flight; no effect on the image.
+struct ReceiverStats {
+    ID3D11Query *query = nullptr;
+    bool pending = false, failed = false;
+    unsigned frame = 0, terrain = 0, models = 0, lilies = 0, lights = 0;
+};
+static ReceiverStats receiverStats;
+static void collectReceiverStats() {
+    auto &s = receiverStats;
+    if (!s.pending)
+        return;
+    D3D11_QUERY_DATA_PIPELINE_STATISTICS data{};
+    if (ctx->GetData(s.query, &data, sizeof(data), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+        return;
+    s.pending = false;
+    char line[320];
+    sprintf_s(line,
+              "Receiver work: terrain=%u models=%u (lilies %u) draws, %u active point lights (max), "
+              "VS invocations=%llu, PS invocations=%llu, triangles=%llu",
+              s.terrain, s.models, s.lilies, s.lights, (unsigned long long)data.VSInvocations,
+              (unsigned long long)data.PSInvocations, (unsigned long long)data.CInvocations);
+    log(line);
+}
+
 static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
+    auto &stats = receiverStats;
+    collectReceiverStats();
+    bool measure = !stats.failed && !stats.pending && stats.frame++ % 600 == 0;
+    if (measure && !stats.query) {
+        D3D11_QUERY_DESC desc{D3D11_QUERY_PIPELINE_STATISTICS, 0};
+        stats.failed = FAILED(device->CreateQuery(&desc, &stats.query));
+        measure = !stats.failed;
+    }
+    unsigned terrainReceivers = 0, modelReceivers = 0, lilyReceivers = 0, maxLights = 0;
+    if (measure)
+        ctx->Begin(stats.query);
     ctx->RSSetState(receiverRaster);
     ctx->OMSetRenderTargets(1, &target, depth);
     ctx->OMSetDepthStencilState(testDepth, 0);
@@ -1331,10 +1465,19 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     // Native model linkage is verified; close models can now use the
     // focused map, retaining hair/armor contact shadows at finer density.
     p.cascade[3] = cascadesEnabled ? 1.f : 0.f;
+    // Next frame's inline terrain samples these maps with these parameters.
+    inlineFrame.params = p;
+    inlineFrame.params.depthAdjust[1] = 0; // terrain path
+    inlineFrame.originX = frameOriginX;
+    inlineFrame.originY = frameOriginY;
+    inlineFrame.ready = frameOriginKnown;
+    // The maps changed: any later inline draw (this pass can run mid-frame, from
+    // FinishWorldLighting) must upload the matching parameters, never mix them.
+    inlineFrame.uploaded = false;
     ID3D11PixelShader *bound = nullptr;
     lastReceivers = 0;
     for (auto &x : draws) {
-        if (beyondFade(x, p))
+        if (x.inlined || beyondFade(x, p))
             continue;
         ++lastReceivers;
         ID3D11PixelShader *shader = x.terrain ? terrainVisibility : modelVisibility;
@@ -1353,11 +1496,22 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
         memcpy(p.proj, x.proj, 64);
         memcpy(p.points, x.pointLights, sizeof(p.points));
         compactPointLights(p);
+        maxLights = std::max(maxLights, (unsigned)p.depthAdjust[2]);
+        ++(x.terrain ? terrainReceivers : modelReceivers);
+        lilyReceivers += x.lily;
         p.depthAdjust[0] = x.depthOffset;
         // Native models use varied scales. Selecting their tolerance by scale
         // can leave parts of the same actor on the terrain self-shadow path.
         p.depthAdjust[1] = x.terrain ? 0.f : 1.f;
         bind(x, p);
+    }
+    if (measure) {
+        ctx->End(stats.query);
+        stats.pending = true;
+        stats.terrain = terrainReceivers;
+        stats.models = modelReceivers;
+        stats.lilies = lilyReceivers;
+        stats.lights = maxLights;
     }
 }
 
@@ -1390,6 +1544,7 @@ static void render() {
         return;
     }
     if (p.config[1] <= 0 && captureRequest.load() == 0) { // No visible shadow (night/horizon).
+        inlineFrame.ready = false;
         clearDraws();
         return;
     }
@@ -1437,9 +1592,9 @@ static void render() {
         capture("Mods\\SteamShadows-after.bmp");
     internal = false;
     lastCount = (unsigned)draws.size();
-    lastInline = 0;
+    lastInline = lastInlineModels = 0;
     for (auto &x : draws)
-        lastInline += x.inlined;
+        (x.terrain ? lastInline : lastInlineModels) += x.inlined;
     frames++;
     QueryPerformanceCounter(&end);
     totalMs += 1000. * (end.QuadPart - begin.QuadPart) / freq.QuadPart;
@@ -1447,8 +1602,9 @@ static void render() {
         char s[512];
         sprintf_s(
             s,
-            "Shadow frame %u: captured=%u, receivers=%u, model casters (both maps)=%u, last-map terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
-            frames, lastCount, lastReceivers, lastModelCasters, lastTerrainCasters,
+            "Shadow frame %u: captured=%u, receivers=%u, inline terrain=%u, inline static models=%u, model casters (both maps)=%u, last-map terrain casters=%u, CPU average=%.3f ms, eye=(%.3f %.3f %.3f), sun=(%.3f %.3f %.3f)%s",
+            frames, lastCount, lastReceivers, lastInline, lastInlineModels, lastModelCasters,
+            lastTerrainCasters,
             totalMs / frames, p.eye[0], p.eye[1], p.eye[2], p.sun[0], p.sun[1], p.sun[2],
             shot ? ", captured before/after" : "");
         log(s);
@@ -1711,6 +1867,8 @@ static void timedRecord(ID3D11DeviceContext *c, UINT count, UINT start, INT base
 }
 // Called once per presented frame. Logs the capture hook's CPU share.
 static void presentTiming() {
+    staticKeysPrevious.swap(staticKeysCurrent);
+    staticKeysCurrent.clear();
     if (hookTimingFrame && ++hookSamples == 60) {
         LARGE_INTEGER freq{};
         QueryPerformanceFrequency(&freq);
@@ -1723,8 +1881,130 @@ static void presentTiming() {
     }
     hookTimingFrame = hookPresents++ % 60 == 0;
 }
+static int nativeKind(ID3D11DeviceChild *shader) {
+    int kind = 0;
+    UINT bytes = sizeof(kind);
+    if (!shader || FAILED(shader->GetPrivateData(nativeShaderGuid, &bytes, &kind)) ||
+        bytes != sizeof(kind))
+        return 0;
+    return kind;
+}
+// Identity of a model draw: mesh, draw range and the transform in absolute
+// world coordinates (the floating origin is added back).
+static uint64_t staticKey(const Draw &x, double originX, double originY) {
+    uint64_t h = 1469598103934665603ull;
+    auto add = [&](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    add(uint64_t(uintptr_t(x.vb)));
+    add(uint64_t(uintptr_t(x.ib)));
+    add(uint64_t(x.count) << 32 | x.start);
+    add(uint64_t(uint32_t(x.base)));
+    for (int i = 0; i < 16; ++i) {
+        if (i == 3 || i == 7)
+            continue;
+        uint32_t bits;
+        memcpy(&bits, &x.world[i], 4);
+        add(bits);
+    }
+    add(uint64_t(int64_t(std::llround((x.world[3] + originX) * 1024))));
+    add(uint64_t(int64_t(std::llround((x.world[7] + originY) * 1024))));
+    return h;
+}
+// Records this model draw for the next frame; true when it was drawn the same
+// way last frame (it is not moving).
+static bool staticModel(const Draw &x) {
+    double ox = frameOriginKnown ? frameOriginX : inlineFrame.originX,
+           oy = frameOriginKnown ? frameOriginY : inlineFrame.originY;
+    uint64_t key = staticKey(x, ox, oy);
+    if (staticKeysCurrent.size() < 65536)
+        staticKeysCurrent.insert(key);
+    return staticKeysPrevious.count(key) != 0;
+}
+
+// Native terrain drawn with Steam's world shaders gets its shadow in this draw,
+// from the previous frame's maps; returns false to draw it natively (and leave
+// it to the receiver pass).
+static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
+    if (!inlineTerrainEnabled || !inlineVS || !enabled || failed || internal || draws.empty() ||
+        draws.back().inlined)
+        return false;
+    bool model = !draws.back().terrain;
+    // Every model draw is remembered, so next frame can tell whether it moved.
+    bool still = model && staticModel(draws.back());
+    if (!inlineFrame.ready || !frameOriginKnown || (model && (!inlineModelsEnabled || !still)))
+        return false;
+    ID3D11VertexShader *nativeVS = nullptr;
+    ID3D11PixelShader *nativePS = nullptr;
+    c->VSGetShader(&nativeVS, nullptr, nullptr);
+    c->PSGetShader(&nativePS, nullptr, nullptr);
+    int vsKind = nativeKind(nativeVS), psKind = nativeKind(nativePS);
+    // A large floating-origin jump since the maps were rendered: their area no
+    // longer covers this view well; use the receiver pass for this frame.
+    double shiftX = frameOriginX - inlineFrame.originX, shiftY = frameOriginY - inlineFrame.originY;
+    bool nearby = std::abs(shiftX) <= 32 && std::abs(shiftY) <= 32;
+    if (vsKind != 1 || (psKind != 2 && psKind != 3) || !nearby) {
+        drop(nativeVS);
+        drop(nativePS);
+        return false;
+    }
+    internal = true;
+    if (!inlineFrame.uploaded) {
+        uploadTo(inlineConstants, &inlineFrame.params, sizeof(Params));
+        // Models: the receiver's small-entity (model) path.
+        Params models = inlineFrame.params;
+        models.depthAdjust[1] = 1;
+        uploadTo(inlineModelConstants, &models, sizeof(Params));
+        // Frame N world positions -> the frame the maps were rendered in.
+        float shift[4] = {(float)(frameOriginX - inlineFrame.originX),
+                          (float)(frameOriginY - inlineFrame.originY), 0, 0};
+        uploadTo(inlineShift, shift, sizeof(shift));
+        inlineFrame.uploaded = true;
+        ++inlineFrames;
+    }
+    ID3D11Buffer *savedVS[2]{}, *savedPS[2]{};
+    ID3D11ShaderResourceView *savedViews[2]{};
+    ID3D11SamplerState *savedSamplers[2]{};
+    c->VSGetConstantBuffers(12, 2, savedVS);
+    c->PSGetConstantBuffers(12, 2, savedPS);
+    c->PSGetShaderResources(0, 2, savedViews);
+    c->PSGetSamplers(0, 2, savedSamplers);
+    ID3D11Buffer *ours[2] = {model ? inlineModelConstants : inlineConstants, inlineShift};
+    ID3D11ShaderResourceView *maps[2] = {mapView, nearView};
+    ID3D11SamplerState *samplers[2] = {sampler, rawSampler};
+    c->VSSetShader(inlineVS, nullptr, 0);
+    c->PSSetShader(model ? inlineModelPS[psKind == 3] : inlinePS[psKind == 3], nullptr, 0);
+    c->VSSetConstantBuffers(12, 2, ours);
+    c->PSSetConstantBuffers(12, 2, ours);
+    c->PSSetShaderResources(0, 2, maps);
+    c->PSSetSamplers(0, 2, samplers);
+    internal = false;
+    oldDI(c, n, s, b);
+    internal = true;
+    c->VSSetShader(nativeVS, nullptr, 0);
+    c->PSSetShader(nativePS, nullptr, 0);
+    c->VSSetConstantBuffers(12, 2, savedVS);
+    c->PSSetConstantBuffers(12, 2, savedPS);
+    c->PSSetShaderResources(0, 2, savedViews);
+    c->PSSetSamplers(0, 2, savedSamplers);
+    internal = false;
+    for (auto *p : savedVS)
+        drop(p);
+    for (auto *p : savedPS)
+        drop(p);
+    for (auto *p : savedViews)
+        drop(p);
+    for (auto *p : savedSamplers)
+        drop(p);
+    drop(nativeVS);
+    drop(nativePS);
+    draws.back().inlined = true;
+    ++(model ? inlineModelDraws : inlineDraws);
+    return true;
+}
 static void STDMETHODCALLTYPE drawIndexed(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
+    size_t before = draws.size();
     timedRecord(c, n, s, b, true);
+    if (draws.size() > before && drawInlineTerrain(c, n, s, b))
+        return;
     oldDI(c, n, s, b);
 }
 static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
@@ -1863,6 +2143,8 @@ static void loadSettings() {
     resolution = resolution < 512 ? 512 : resolution > 4096 ? 4096 : resolution;
     radius = (float)GetPrivateProfileIntW(L"Shadows", L"Radius", 120, ini);
     cascadesEnabled = GetPrivateProfileIntW(L"Shadows", L"Cascades", 1, ini) != 0;
+    inlineTerrainEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineTerrain", 1, ini) != 0;
+    inlineModelsEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineModels", 1, ini) != 0;
     nearResolution =
         std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini), 512u,
                    4096u);
@@ -1874,6 +2156,49 @@ static void loadSettings() {
     // from the sun in the unmodified game.
     strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 100, ini) * .01f;
     strength = strength < 0 ? 0 : strength > 1 ? 1 : strength;
+}
+using CreateVS = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const void *, SIZE_T,
+                                             ID3D11ClassLinkage *, ID3D11VertexShader **);
+using CreatePS = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const void *, SIZE_T,
+                                             ID3D11ClassLinkage *, ID3D11PixelShader **);
+static CreateVS oldCreateVS = nullptr;
+static CreatePS oldCreatePS = nullptr;
+constexpr UINT SLOT_CREATE_VERTEX_SHADER = 12, SLOT_CREATE_PIXEL_SHADER = 15;
+// 1 world VS (0x436fb0), 2 plain world PS (0x43b500), 3 shine world PS (0x438810).
+static int nativeShaderKind(const void *code, SIZE_T size) {
+    static const unsigned char sums[3][16] = {
+        {0x36, 0xee, 0xbd, 0x83, 0x37, 0x7d, 0xce, 0xbb, 0x94, 0x39, 0x0d, 0xdf, 0xbb, 0x86, 0xe5, 0x1b},
+        {0xfd, 0xc8, 0xc9, 0x99, 0x8e, 0xa5, 0xb1, 0x17, 0x0f, 0xc6, 0x30, 0x5e, 0x4a, 0x56, 0x3b, 0xf4},
+        {0x28, 0xd6, 0x77, 0x04, 0x93, 0xf4, 0x67, 0x8c, 0x9f, 0xb9, 0x37, 0xb6, 0xb6, 0x7d, 0xcd, 0x07}};
+    if (!code || size < 32 || memcmp(code, "DXBC", 4))
+        return 0;
+    for (int i = 0; i < 3; ++i)
+        if (!memcmp((const unsigned char *)code + 4, sums[i], 16))
+            return i + 1;
+    return 0;
+}
+static HRESULT STDMETHODCALLTYPE createVS(ID3D11Device *d, const void *code, SIZE_T size,
+                                          ID3D11ClassLinkage *linkage, ID3D11VertexShader **out) {
+    HRESULT hr = oldCreateVS(d, code, size, linkage, out);
+    int kind = nativeShaderKind(code, size);
+    if (SUCCEEDED(hr) && out && *out && kind == 1) {
+        (*out)->SetPrivateData(nativeShaderGuid, sizeof(kind), &kind);
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            log("Steam world shaders recognised; terrain gets inline shadows (InlineTerrain=0 "
+                "in SteamShadows.ini uses the receiver pass instead).");
+        }
+    }
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE createPS(ID3D11Device *d, const void *code, SIZE_T size,
+                                          ID3D11ClassLinkage *linkage, ID3D11PixelShader **out) {
+    HRESULT hr = oldCreatePS(d, code, size, linkage, out);
+    int kind = nativeShaderKind(code, size);
+    if (SUCCEEDED(hr) && out && *out && (kind == 2 || kind == 3))
+        (*out)->SetPrivateData(nativeShaderGuid, sizeof(kind), &kind);
+    return hr;
 }
 static DWORD attach() {
     loadSettings();
