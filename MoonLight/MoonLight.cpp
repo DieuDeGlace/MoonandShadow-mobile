@@ -12,6 +12,7 @@
 #include "cwsdk.h"
 #include "../NativeScene.h"
 #include "MoonRules.h"
+#include "../BufferLayout.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <atomic>
@@ -358,15 +359,9 @@ static Saved prepare(ID3D11DeviceContext *c) {
     if (phase.weight <= 0)
         return saved;
     c->VSGetConstantBuffers(0, NATIVE_CB_COUNT, saved.b);
-    const UINT sizes[] = {64, 64, 64, 16, 320, 48, 16, 16, 16};
-    bool native = true;
-    for (int i = 0; i < 9; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (saved.b[i])
-            saved.b[i]->GetDesc(&d);
-        if (d.ByteWidth != sizes[i])
-            native = false;
-    }
+    static const UINT sizes[NATIVE_CB_COUNT] = {64, 64, 64, 16, 320, 48, 16, 16, 16};
+    static BufferLayout<NATIVE_CB_COUNT> layout;
+    bool native = layout.matches(saved.b, sizes);
     float projection[16]{};
     bool gotProjection = read(saved.b[CB_PROJECTION], projection, 64);
     if (gotProjection && fabsf(projection[15]) > .5f) {
