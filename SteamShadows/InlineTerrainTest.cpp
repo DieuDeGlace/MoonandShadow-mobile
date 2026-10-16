@@ -38,11 +38,50 @@ ID3D11Buffer *constant(ID3D11Device *d, const void *data, UINT bytes) {
     assert(SUCCEEDED(d->CreateBuffer(&desc, &init, &buffer)));
     return buffer;
 }
+void verifyInlineSlots() {
+    std::string source = std::string(shadows::hlsl) + inlineTerrain::hlsl;
+    for (int variant = 0; variant < 5; ++variant) {
+        bool vertex = variant == 0, model = variant >= 3;
+        const D3D_SHADER_MACRO macros[] = {
+            {"MODEL_DIRECT_LIGHT", "1"},
+            {"INLINE_TERRAIN", "1"},
+            {vertex ? "INLINE_VS" : "INLINE_PS", "1"},
+            {"INLINE_SHINE", variant == 2 || variant == 4 ? "1" : "0"},
+            {model ? "MODEL_PLANE_FILTER" : "INLINE_UNUSED", "1"},
+            {nullptr, nullptr}};
+        ID3DBlob *code = nullptr;
+        assert(SUCCEEDED(D3DCompile(source.c_str(), source.size(), "InlineSlotTest", macros,
+                                    nullptr, vertex ? "inlineTerrainVertex" : "inlineTerrainPixel",
+                                    vertex  ? "vs_4_0"
+                                    : model ? "ps_4_1"
+                                            : "ps_4_0",
+                                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, nullptr)));
+        ID3D11ShaderReflection *reflection = nullptr;
+        assert(SUCCEEDED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(),
+                                    __uuidof(ID3D11ShaderReflection), (void **)&reflection)));
+        D3D11_SHADER_INPUT_BIND_DESC binding{};
+        assert(SUCCEEDED(
+            reflection->GetResourceBindingDescByName(vertex ? "InlineShift" : "Params", &binding)));
+        assert(binding.Type == D3D_SIT_CBUFFER && binding.BindPoint == (vertex ? 13u : 12u));
+        assert(FAILED(
+            reflection->GetResourceBindingDescByName(vertex ? "Params" : "InlineShift", &binding)));
+        reflection->Release();
+        code->Release();
+    }
+    puts("Compiled inline shader constant slots: VS b13 only, PS b12 only: PASS");
+}
+HRESULT STDMETHODCALLTYPE failInlineMap(ID3D11DeviceContext *c, ID3D11Resource *resource, UINT sub,
+                                        D3D11_MAP mode, UINT flags,
+                                        D3D11_MAPPED_SUBRESOURCE *mapped) {
+    return resource == shadows::inlineConstants ? E_FAIL
+                                                : c->Map(resource, sub, mode, flags, mapped);
+}
 } // namespace
 
 int main(int argc, char **argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const char *path = argc > 1 ? argv[1] : "../../../../cubeworld.exe";
+    bool warp = argc > 1 && !strcmp(argv[1], "warp");
+    const char *path = argc > 1 && !warp ? argv[1] : "../../../../cubeworld.exe";
     auto vsCode = readShader(path, 0x436fb0), plainCode = readShader(path, 0x43b500),
          shineCode = readShader(path, 0x438810);
     if (vsCode.empty() || plainCode.empty() || shineCode.empty()) {
@@ -51,8 +90,8 @@ int main(int argc, char **argv) {
     }
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
-                                 D3D11_SDK_VERSION, &d, nullptr, &c)))
+    if (FAILED(D3D11CreateDevice(nullptr, warp ? D3D_DRIVER_TYPE_WARP : D3D_DRIVER_TYPE_HARDWARE,
+                                 nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &d, nullptr, &c)))
         assert(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
                                            D3D11_SDK_VERSION, &d, nullptr, &c)));
     using namespace shadows;
@@ -67,6 +106,7 @@ int main(int argc, char **argv) {
     nearResolution = 1024;
     assert(initialize(c));
     assert(inlineVS && inlinePS[0] && inlinePS[1]);
+    verifyInlineSlots();
 
     // Steam's shaders, created through the tagging hook.
     ID3D11VertexShader *nativeVS = nullptr;
@@ -123,8 +163,14 @@ int main(int argc, char **argv) {
     assert(SUCCEEDED(d->CreateBuffer(&bd, &init, &ib)));
 
     const UINT size = 512;
-    D3D11_TEXTURE2D_DESC td{size, size, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0},
-                            D3D11_USAGE_DEFAULT, D3D11_BIND_RENDER_TARGET};
+    D3D11_TEXTURE2D_DESC td{size,
+                            size,
+                            1,
+                            1,
+                            DXGI_FORMAT_R8G8B8A8_UNORM,
+                            {1, 0},
+                            D3D11_USAGE_DEFAULT,
+                            D3D11_BIND_RENDER_TARGET};
     ID3D11Texture2D *color = nullptr, *readback = nullptr, *depthTexture = nullptr;
     ID3D11RenderTargetView *rtv = nullptr;
     ID3D11DepthStencilView *dsv = nullptr;
@@ -158,9 +204,10 @@ int main(int argc, char **argv) {
         oldClear(c, nearDepth, D3D11_CLEAR_DEPTH, .4f, 0);
 
     // Native constants: a camera above the area, sun overhead, two local lights.
-    float P[16]{}, V[16]{}, W[16]{}, material[4] = {.95f, .9f, .85f, 1}, points[80]{},
-          light[12] = {.9f, .85f, .7f, 0, .25f, .25f, .35f, 0, .3f, .2f, .93f, 0},
-          ambient[4] = {.35f, .35f, .4f, .55f}, white = 0, depthOffset = 0, glow = 0;
+    float P[16]{}, V[16]{}, W[16]{},
+        material[4] = {.95f, .9f, .85f, 1}, points[80]{},
+        light[12] = {.9f, .85f, .7f, 0, .25f, .25f, .35f, 0, .3f, .2f, .93f, 0},
+        ambient[4] = {.35f, .35f, .4f, .55f}, white = 0, depthOffset = 0, glow = 0;
     P[0] = P[5] = 1.f / 130, P[10] = 1.f / 400, P[11] = .5f, P[15] = 1;
     V[0] = V[5] = V[10] = V[15] = 1;
     V[3] = -128, V[7] = -128, V[11] = -150;
@@ -196,7 +243,8 @@ int main(int argc, char **argv) {
         M[0] = cs, M[1] = -sn, M[4] = sn, M[5] = cs, M[10] = .9f, M[15] = 1;
         M[3] = 128 - (cs * 128 - sn * 128), M[7] = 128 - (sn * 128 + cs * 128), M[11] = 15;
     }
-    auto run = [&](int mode, int shine, float originShift, bool model) -> std::vector<unsigned char> {
+    auto run = [&](int mode, int shine, float originShift,
+                   bool model) -> std::vector<unsigned char> {
         bool inlineDraw = mode == 2;
         float world[16], view[16];
         memcpy(world, model ? M : W, 64);
@@ -210,10 +258,10 @@ int main(int argc, char **argv) {
         for (int j = 0; j < 10; ++j)
             shifted[j * 4] -= originShift;
         view[3] += originShift;
-        ID3D11Buffer *vcbs[10] = {constant(d, P, 64),       constant(d, view, 64),
-                                  constant(d, world, 64),   constant(d, material, 16),
-                                  constant(d, shifted, 320), constant(d, light, 48),
-                                  constant(d, ambient, 16), constant(d, &white, 4),
+        ID3D11Buffer *vcbs[10] = {constant(d, P, 64),           constant(d, view, 64),
+                                  constant(d, world, 64),       constant(d, material, 16),
+                                  constant(d, shifted, 320),    constant(d, light, 48),
+                                  constant(d, ambient, 16),     constant(d, &white, 4),
                                   constant(d, &depthOffset, 4), constant(d, &glow, 4)};
         float clear[4] = {.1f, .2f, .3f, 1};
         c->ClearRenderTargetView(rtv, clear);
@@ -227,6 +275,9 @@ int main(int argc, char **argv) {
         c->PSSetShader(nativePS[shine], nullptr, 0);
         c->VSSetConstantBuffers(0, 10, vcbs);
         c->PSSetConstantBuffers(0, 6, pcbs);
+        ID3D11Buffer *sentinelVS[2] = {vcbs[0], vcbs[1]}, *sentinelPS[2] = {pcbs[0], pcbs[1]};
+        c->VSSetConstantBuffers(12, 2, sentinelVS);
+        c->PSSetConstantBuffers(12, 2, sentinelPS);
         c->RSSetState(nativeRaster);
         c->RSSetViewports(1, &viewport);
         c->OMSetDepthStencilState(nativeDepth, 0);
@@ -244,7 +295,9 @@ int main(int argc, char **argv) {
         x.lightProtection = std::clamp(std::max(white, glow), 0.f, 1.f);
         x.depthOffset = depthOffset;
         draws.push_back(x);
-        if (inlineDraw) {
+        if (mode < 0) {
+            // Background-only reference for coverage checks on smaller poses.
+        } else if (inlineDraw) {
             // The previous frame (path A) left inlineFrame; this frame's origin moved.
             frameOriginKnown = true;
             frameOriginX = inlineFrame.originX + originShift;
@@ -252,8 +305,20 @@ int main(int argc, char **argv) {
             inlineFrame.uploaded = false;
             if (model) // it was drawn identically last frame: a static model
                 staticKeysPrevious.insert(staticKey(draws.back(), frameOriginX, frameOriginY));
+            rawMap = failInlineMap;
+            assert(!drawInlineTerrain(c, x.count, 0, 0));
+            assert(!internal && !draws.back().inlined && !inlineFrame.uploaded);
+            rawMap = nullptr;
             assert(drawInlineTerrain(c, x.count, 0, 0));
             assert(draws.back().inlined);
+            ID3D11Buffer *afterVS[2]{}, *afterPS[2]{};
+            c->VSGetConstantBuffers(12, 2, afterVS);
+            c->PSGetConstantBuffers(12, 2, afterPS);
+            for (int slot = 0; slot < 2; ++slot) {
+                assert(afterVS[slot] == sentinelVS[slot] && afterPS[slot] == sentinelPS[slot]);
+                drop(afterVS[slot]);
+                drop(afterPS[slot]);
+            }
         } else if (mode == 0) {
             oldDI(c, x.count, 0, 0);
         } else {
@@ -288,39 +353,88 @@ int main(int argc, char **argv) {
         return image;
     };
 
-    for (bool model : {false, true})
-    for (int shine = 0; shine < 2; ++shine)
-        for (float shift : {0.f, 16.f}) {
-            auto native = run(0, shine, 0, model);
-            auto before = run(1, shine, 0, model); // also leaves inlineFrame for the next frame
-            auto after = run(2, shine, shift, model);
-            int worst = 0;
-            size_t shadowed = 0, bad = 0, reported = 0;
-            for (size_t i = 0; i < before.size(); i += 4) {
-                int change = 0;
-                for (int k = 0; k < 3; ++k) {
-                    worst = std::max(worst, abs(int(before[i + k]) - int(after[i + k])));
-                    change = std::max(change, abs(int(before[i + k]) - int(native[i + k])));
-                }
-                shadowed += change > 8;
-                int diff = 0;
-                for (int k = 0; k < 3; ++k)
-                    diff = std::max(diff, abs(int(before[i + k]) - int(after[i + k])));
-                if (diff > 2 && reported++ < 6)
-                    printf("  pixel (%zu,%zu): native %d,%d,%d receiver %d,%d,%d inline %d,%d,%d\n",
-                           (i / 4) % size, (i / 4) / size, native[i], native[i + 1], native[i + 2],
-                           before[i], before[i + 1], before[i + 2], after[i], after[i + 1],
-                           after[i + 2]);
-                bad += diff > 2;
-            }
-            printf("  pixels differing by more than 2/255: %zu\n", bad);
-            printf("%s %s, origin shift %.0f: %zu pixels changed by the shadow, inline vs receiver "
-                   "max difference %d/255\n",
-                   model ? "static model" : "terrain", shine ? "shine" : "plain", shift, shadowed,
-                   worst);
-            assert(shadowed > size * size / 20); // the shadow really shades part of the image
-            assert(worst <= 2);
+    for (unsigned lightCount : {0u, 2u, 10u}) {
+        for (unsigned j = 2; j < 10; ++j) {
+            points[j * 4] = 24.f + float(j % 4) * 61;
+            points[j * 4 + 1] = 35.f + float(j / 4) * 83;
+            points[j * 4 + 2] = 130.f;
+            points[j * 4 + 3] = j < lightCount ? 18.f : 0.f;
+            points[40 + j * 4] = .1f;
+            points[41 + j * 4] = .15f;
+            points[42 + j * 4] = .2f;
         }
-    puts("Inline terrain shadows match the receiver pass PASS");
+        points[3] = lightCount ? 30.f : 0.f;
+        points[7] = lightCount ? 25.f : 0.f;
+        for (unsigned pose = 0; pose < 5; ++pose) {
+            bool model = pose != 0;
+            if (model) {
+                float cs = .9f * cosf(.5236f), sn = .9f * sinf(.5236f);
+                memset(M, 0, sizeof(M));
+                M[0] = cs;
+                M[1] = -sn;
+                M[4] = sn;
+                M[5] = cs;
+                M[10] = .9f;
+                M[15] = 1;
+                if (pose == 2) {
+                    M[0] = -M[0];
+                    M[4] = -M[4];
+                }
+                if (pose == 3) {
+                    M[0] *= .7f;
+                    M[4] *= .7f;
+                    M[10] = .55f;
+                }
+                if (pose == 4) {
+                    M[1] += .15f;
+                    M[2] = .05f;
+                    M[9] = .03f;
+                }
+                M[3] = 128 - M[0] * 128 - M[1] * 128 - M[2] * 130;
+                M[7] = 128 - M[4] * 128 - M[5] * 128;
+                M[11] = 130 - M[10] * 130;
+            }
+            for (int shine = 0; shine < 2; ++shine)
+                for (float shift : {0.f, 16.f}) {
+                    auto background = run(-1, shine, 0, model);
+                    auto native = run(0, shine, 0, model);
+                    auto before =
+                        run(1, shine, 0, model); // also leaves inlineFrame for the next frame
+                    auto after = run(2, shine, shift, model);
+                    int worst = 0;
+                    size_t shadowed = 0, visible = 0, bad = 0, reported = 0;
+                    for (size_t i = 0; i < before.size(); i += 4) {
+                        int change = 0;
+                        for (int k = 0; k < 3; ++k) {
+                            worst = std::max(worst, abs(int(before[i + k]) - int(after[i + k])));
+                            change = std::max(change, abs(int(before[i + k]) - int(native[i + k])));
+                        }
+                        shadowed += change > 8;
+                        visible += native[i] != background[i] ||
+                                   native[i + 1] != background[i + 1] ||
+                                   native[i + 2] != background[i + 2];
+                        int diff = 0;
+                        for (int k = 0; k < 3; ++k)
+                            diff = std::max(diff, abs(int(before[i + k]) - int(after[i + k])));
+                        if (diff > 2 && reported++ < 6)
+                            printf(
+                                "  pixel (%zu,%zu): native %d,%d,%d receiver %d,%d,%d inline %d,%d,%d\n",
+                                (i / 4) % size, (i / 4) / size, native[i], native[i + 1],
+                                native[i + 2], before[i], before[i + 1], before[i + 2], after[i],
+                                after[i + 1], after[i + 2]);
+                        bad += diff > 2;
+                    }
+                    printf("  pixels differing by more than 2/255: %zu\n", bad);
+                    printf(
+                        "%s pose %u, lights %u, %s, origin shift %.0f: %zu pixels changed by the shadow, inline vs receiver "
+                        "max difference %d/255\n",
+                        model ? "static model" : "terrain", pose, lightCount,
+                        shine ? "shine" : "plain", shift, shadowed, worst);
+                    assert(visible > 1000 && shadowed > visible / 20);
+                    assert(worst <= 2);
+                }
+        }
+    }
+    puts("Inline lighting, shadow pixels, binding preservation and upload fallback: PASS");
     return 0;
 }

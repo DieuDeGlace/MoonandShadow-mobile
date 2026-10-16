@@ -51,3 +51,8 @@ Merged upstream main at 7880a89: vanilla shadow darkness (#3), camera-distance f
 The mobile75 preset keeps its values and adds `CameraFade=1` and `SunFromGame=1`, which are also the defaults. Note that #3 changed what `StrengthPercent` means: it is now the share of the game's direct sunlight a shadow removes, and 100 matches a face turned away from the sun. The preset's 45 therefore gives lighter shadows than the PC default of 100. 75 would match the preset's original "75% of PC" intent.
 
 All nine CTest suites pass with the mobile identity (WARP and local hardware). Device testing on GameNative is still needed.
+
+
+## Rendering performance sync — 2026-10-15
+
+Applied directly to mobile main from desktop `4c223154fe28132efa1147e096221f772af127f2`. Ports instanced model shadow casters, conservative cached-terrain bounds and reduced inline-state inspection/restoration. Existing shadow geometry/lighting and animation coordination are preserved. The mobile executable identity guard, cached validation and mobile configuration presets are retained. Builds remain Windows x64 DLLs for GameNative, not Android shared libraries. Desktop CPU/GPU fixture results are not phone performance measurements. Preserve existing phone INIs when installing. PC regression checks and phone deployment verification are recorded with the release artifacts; gameplay performance/visual confirmation remains required.
