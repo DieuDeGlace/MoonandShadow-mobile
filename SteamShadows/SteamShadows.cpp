@@ -858,7 +858,9 @@ float4 visibility(V i):SV_TARGET{
     }
     // Preserve the native lantern color. Synthetic fill tied to shadow visibility
     // stamped a second colored silhouette into the illuminated ground.
-    float protection=max(local,lanternProtection);
+    // Like Omega, lantern and point light lighten a shadow (up to half of it)
+    // instead of removing it, so the shadow stays visible inside the light.
+    float protection=.5*max(local,lanternProtection);
     float alpha=opacity*(1-protection);
     float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
 #ifdef MODEL_DIRECT_LIGHT
