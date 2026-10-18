@@ -210,6 +210,14 @@ struct Draw {
     float alpha = 1;
 };
 constexpr float OPAQUE_ALPHA = .99f, INVISIBLE_ALPHA = .05f;
+// Diagnostics for see-through world draws (how the game fades e.g. a rogue
+// in stealth): logged with the periodic caster line.
+struct SeeThroughStats {
+    unsigned draws = 0, alphaUnread = 0, translucent = 0, blended = 0, coverage = 0;
+    float minAlpha = 1, minBlendedAlpha = 1, minFactor = 1;
+    int srcBlend = 0, destBlend = 0;
+};
+static SeeThroughStats seeThrough;
 static std::vector<Draw> draws; // This frame's receivers.
 
 // A cloud cached in absolute world coordinates (clouds are often not drawn every
@@ -884,7 +892,9 @@ float4 visibility(V i):SV_TARGET{
     // Darkness (sunTone.w) also removes part of the remaining light, only on
     // faces turned to the sun: faces turned away are on the native dark side
     // already and must not darken everywhere.
-    float darkness=sunTone.w*smoothstep(.05,.25,facing);
+    // Only faces past the grazing band (exposure fades over facing .15-.30),
+    // where low visibility means a real occluder rather than the grazing shade.
+    float darkness=sunTone.w*smoothstep(.30,.45,facing);
     output.transmission=float4(saturate(1-alpha*(i.directFraction+darkness*(1-i.directFraction))),1);
     return output;
 #else
@@ -1665,7 +1675,7 @@ static void render() {
         (x.terrain ? lastInline : lastInlineModels) += x.inlined;
     frames++;
     if (frames == 1 || shot || frames % 600 == 0) {
-        char line[256];
+        char line[512];
         sprintf_s(line,
                   "Model caster submissions (both maps): %u objects -> %u draws; "
                   "%u instances batched, %u see-through (dithered), BatchCasters=%d",
@@ -1677,6 +1687,15 @@ static void render() {
                   "TightTerrainBounds=%d",
                   terrainCandidates, terrainSubmissions, tightTerrainBounds);
         log(line);
+        auto &t = seeThrough;
+        sprintf_s(line,
+                  "See-through check (since last line): %u world draws, alpha unread %u, "
+                  "alpha<1 %u (min %.3f), alpha-to-coverage %u, blended (skipped) %u "
+                  "(min alpha %.3f, min blend factor %.3f, src %d dest %d)",
+                  t.draws, t.alphaUnread, t.translucent, t.minAlpha, t.coverage, t.blended,
+                  t.minBlendedAlpha, t.minFactor, t.srcBlend, t.destBlend);
+        log(line);
+        t = {};
     }
     QueryPerformanceCounter(&end);
     totalMs += 1000. * (end.QuadPart - begin.QuadPart) / freq.QuadPart;
@@ -1753,26 +1772,32 @@ static bool nativeWorldBuffers(ID3D11Buffer *const buffers[6]) {
 }
 // Whether the bound blend state blends render target 0. Blend descriptions are
 // immutable; the last state is retained and its answer reused.
-static bool blendsTarget(ID3D11DeviceContext *c) {
+static bool blendsTarget(ID3D11DeviceContext *c, bool &coverage, float &factorAlpha,
+                         D3D11_BLEND_DESC &desc) {
     static ID3D11BlendState *last = nullptr;
-    static bool lastBlends = false, known = false;
+    static D3D11_BLEND_DESC lastDesc{};
+    static bool known = false;
     ID3D11BlendState *bs = nullptr;
     float factor[4];
     UINT mask;
     c->OMGetBlendState(&bs, factor, &mask);
     if (!known || bs != last) {
-        D3D11_BLEND_DESC bd{};
+        lastDesc = {};
+        lastDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        lastDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
         if (bs)
-            bs->GetDesc(&bd);
+            bs->GetDesc(&lastDesc);
         if (bs)
             bs->AddRef();
         drop(last);
         last = bs;
-        lastBlends = bd.RenderTarget[0].BlendEnable != FALSE;
         known = true;
     }
     drop(bs);
-    return lastBlends;
+    desc = lastDesc;
+    coverage = lastDesc.AlphaToCoverageEnable != FALSE;
+    factorAlpha = factor[3];
+    return lastDesc.RenderTarget[0].BlendEnable != FALSE;
 }
 
 // Called before every native draw. Records opaque world draws as shadow
@@ -1828,6 +1853,8 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     float alphaValues[4] = {1, 1, 1, 1};
     if (readBuffer(alphaBuffer, alphaValues, 16) && std::isfinite(alphaValues[0]))
         x.alpha = std::clamp(alphaValues[0], 0.f, 1.f);
+    else
+        ++seeThrough.alphaUnread;
     drop(alphaBuffer);
     if (!ok)
         return false;
@@ -1858,7 +1885,22 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         log(s);
     }
     // Blended (transparent) draws are not shadow receivers.
-    if (blendsTarget(c)) {
+    bool coverage = false;
+    float factorAlpha = 1;
+    D3D11_BLEND_DESC blendDesc{};
+    bool blended = blendsTarget(c, coverage, factorAlpha, blendDesc);
+    ++seeThrough.draws;
+    seeThrough.coverage += coverage;
+    seeThrough.translucent += x.alpha < OPAQUE_ALPHA;
+    seeThrough.minAlpha = std::min(seeThrough.minAlpha, x.alpha);
+    if (blended) {
+        ++seeThrough.blended;
+        seeThrough.minBlendedAlpha = std::min(seeThrough.minBlendedAlpha, x.alpha);
+        seeThrough.minFactor = std::min(seeThrough.minFactor, factorAlpha);
+        seeThrough.srcBlend = blendDesc.RenderTarget[0].SrcBlend;
+        seeThrough.destBlend = blendDesc.RenderTarget[0].DestBlend;
+    }
+    if (blended) {
         if (captureRequest.load() && diagnosticRejects++ < 8)
             log("Skipped blended scene draw.");
         return false;
