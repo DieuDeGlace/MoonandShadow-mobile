@@ -761,34 +761,64 @@ bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float t
     return all(abs(p.xy) < 1 - 2 * texel) && p.z >= 0 && p.z <= 1;
 }
 
+// Set by modelPlaneVisibility: 1 when nothing more than FAR_OCCLUDER (2.5
+// blocks) above the face blocks the sun, i.e. any shadow is the model's own.
+static float modelFarLit = 1;
 float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
-    // At noon the light grazes vertical voxel faces. Their shadow projection
-    // is thinner than a texel, so nearby faces can alternate across the filter
-    // footprint. Give those faces one consistent directional shade instead.
-    // Native ambient/back/local light is retained by the model blend below.
-    float facing = dot(normalize(i.n), sun.xyz);
-    float exposure = smoothstep(.15, .30, facing);
-    [branch] if (exposure <= 0)
-        return 0;
+    // Faces turned away from the sun keep the game's own lighting: the model
+    // itself (within FAR_OCCLUDER of the face) never counts as their shadow,
+    // only something well above it, like a tree canopy. At noon the light grazes vertical and sloped voxel faces: their shadow
+    // projection is thinner than a texel, so comparing at the surface lets a
+    // face shadow itself in stripes. Grazing faces are compared from a point
+    // two texels off the surface along the normal instead, where only real
+    // occluders (other hair steps, trees) can block the sun.
+    float3 n = normalize(i.n);
+    float facing = dot(n, sun.xyz);
+    float sunSide = smoothstep(0, .10, facing);
+    modelFarLit = 1;
     if (!modelMapCovered(i.w, transform, region.x))
-        return exposure;
-    float3 p = mul(transform, float4(i.w, 1)).xyz;
-    float2 uv = float2(p.x, -p.y) * .5 + .5;
-    // Signed plane gradient in shadow UV coordinates. The orthographic rows
-    // carry their own scale; eye.w is twice the inverse light-depth span.
-    float denominator = dot(i.n, transform[2].xyz);
-    denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
-    float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
-    float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
-    float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
-    [branch] if (sun.w > .5) {
-        float lit = 0;
-        [unroll] for (int y = -1; y <= 1; y++)
-            [unroll] for (int x = -1; x <= 1; x++)
-                lit += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
-        return exposure * lit / 9;
+        return 1;
+    // Depth row scale: world units -> light depth. 2.5 blocks clears a
+    // character's own body.
+    {
+        float3 p = mul(transform, float4(i.w, 1)).xyz;
+        float2 uv = float2(p.x, -p.y) * .5 + .5;
+        float farBias = 2.5 * length(transform[2].xyz);
+        modelFarLit = planeComparison(map, uv, p.z, 0, region.x, farBias, 0);
     }
-    return exposure * planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+    float away = modelFarLit;
+    [branch] if (sunSide <= 0)
+        return away;
+    float exposure = smoothstep(.15, .30, facing);
+    float lit = 0;
+    [branch] if (exposure < 1) {
+        float texelWorld = region.x * 2 / max(length(transform[0].xyz), 1e-6);
+        float3 q = mul(transform, float4(i.w + n * texelWorld * 2, 1)).xyz;
+        float2 quv = float2(q.x, -q.y) * .5 + .5;
+        float grazing = planeComparison(map, quv, q.z, 0, region.x, region.z * 3, 0);
+        lit += (1 - exposure) * grazing;
+    }
+    [branch] if (exposure > 0) {
+        float3 p = mul(transform, float4(i.w, 1)).xyz;
+        float2 uv = float2(p.x, -p.y) * .5 + .5;
+        // Signed plane gradient in shadow UV coordinates. The orthographic rows
+        // carry their own scale; eye.w is twice the inverse light-depth span.
+        float denominator = dot(i.n, transform[2].xyz);
+        denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
+        float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
+        float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
+        float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
+        float plane = 0;
+        [branch] if (sun.w > .5) {
+            [unroll] for (int y = -1; y <= 1; y++)
+                [unroll] for (int x = -1; x <= 1; x++)
+                    plane += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
+            plane /= 9;
+        } else
+            plane = planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+        lit += exposure * plane;
+    }
+    return lerp(away, lit, sunSide);
 }
 #endif
 
@@ -904,6 +934,12 @@ float4 visibility(V i):SV_TARGET{
     // Only faces past the grazing band (exposure fades over facing .15-.30),
     // where low visibility means a real occluder rather than the grazing shade.
     float darkness=sunTone.w*smoothstep(.30,.45,facing);
+#ifdef MODEL_PLANE_FILTER
+    // Models: the extra darkness only under something well above them (a
+    // tree); a model's shadows on itself (hair steps, arms) keep the native
+    // dark-side level, so small voxel bumps do not speckle.
+    darkness*=1-modelFarLit;
+#endif
     output.transmission=float4(saturate(1-alpha*(i.directFraction+darkness*(1-i.directFraction))),1);
     return output;
 #else
