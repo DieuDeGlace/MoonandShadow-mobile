@@ -761,10 +761,13 @@ bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float t
     return all(abs(p.xy) < 1 - 2 * texel) && p.z >= 0 && p.z <= 1;
 }
 
+// Set by modelPlaneVisibility: 1 when nothing more than FAR_OCCLUDER (2.5
+// blocks) above the face blocks the sun, i.e. any shadow is the model's own.
+static float modelFarLit = 1;
 float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
-    // Faces turned away from the sun keep one consistent directional shade
-    // (native ambient/back/local light is retained by the model blend below).
-    // At noon the light grazes vertical and sloped voxel faces: their shadow
+    // Faces turned away from the sun keep the game's own lighting: the model
+    // itself (within FAR_OCCLUDER of the face) never counts as their shadow,
+    // only something well above it, like a tree canopy. At noon the light grazes vertical and sloped voxel faces: their shadow
     // projection is thinner than a texel, so comparing at the surface lets a
     // face shadow itself in stripes. Grazing faces are compared from a point
     // two texels off the surface along the normal instead, where only real
@@ -772,10 +775,20 @@ float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Tex
     float3 n = normalize(i.n);
     float facing = dot(n, sun.xyz);
     float sunSide = smoothstep(0, .10, facing);
-    [branch] if (sunSide <= 0)
-        return 0;
+    modelFarLit = 1;
     if (!modelMapCovered(i.w, transform, region.x))
-        return sunSide;
+        return 1;
+    // Depth row scale: world units -> light depth. 2.5 blocks clears a
+    // character's own body.
+    {
+        float3 p = mul(transform, float4(i.w, 1)).xyz;
+        float2 uv = float2(p.x, -p.y) * .5 + .5;
+        float farBias = 2.5 * length(transform[2].xyz);
+        modelFarLit = planeComparison(map, uv, p.z, 0, region.x, farBias, 0);
+    }
+    float away = modelFarLit;
+    [branch] if (sunSide <= 0)
+        return away;
     float exposure = smoothstep(.15, .30, facing);
     float lit = 0;
     [branch] if (exposure < 1) {
@@ -805,7 +818,7 @@ float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Tex
             plane = planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
         lit += exposure * plane;
     }
-    return sunSide * lit;
+    return lerp(away, lit, sunSide);
 }
 #endif
 
@@ -921,6 +934,12 @@ float4 visibility(V i):SV_TARGET{
     // Only faces past the grazing band (exposure fades over facing .15-.30),
     // where low visibility means a real occluder rather than the grazing shade.
     float darkness=sunTone.w*smoothstep(.30,.45,facing);
+#ifdef MODEL_PLANE_FILTER
+    // Models: the extra darkness only under something well above them (a
+    // tree); a model's shadows on itself (hair steps, arms) keep the native
+    // dark-side level, so small voxel bumps do not speckle.
+    darkness*=1-modelFarLit;
+#endif
     output.transmission=float4(saturate(1-alpha*(i.directFraction+darkness*(1-i.directFraction))),1);
     return output;
 #else
