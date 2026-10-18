@@ -88,7 +88,7 @@ struct CasterPlan {
         links.clear();
         worlds.clear();
         for (const auto &x : draws) {
-            if (x.terrain || x.lilyPad || !intersectsMap(x, p))
+            if (x.terrain || x.lilyPad || x.alpha < OPAQUE_ALPHA || !intersectsMap(x, p))
                 continue;
             auto slot = lookup.emplace(casterKey(x), groups.size());
             size_t link = links.size();
@@ -115,10 +115,41 @@ struct CasterPlan {
 };
 static CasterPlan casterPlan;
 
+// See-through models (stealth): drawn after the opaque ones with the dithered
+// caster shader, at most SEE_THROUGH_SHADOW_CAP of a full shadow; nearly
+// invisible ones cast nothing.
+static void renderTranslucentCasters(Params &p) {
+    bool bound = false;
+    float savedAlpha = p.modelAmbient[3];
+    for (const auto &x : draws) {
+        if (x.terrain || x.lilyPad || x.alpha >= OPAQUE_ALPHA || x.alpha < INVISIBLE_ALPHA ||
+            !intersectsMap(x, p))
+            continue;
+        if (!bound) {
+            ctx->PSSetShader(translucentCaster, nullptr, 0);
+            ctx->PSSetConstantBuffers(0, 1, &constants);
+            bound = true;
+        }
+        p.modelAmbient[3] = std::min(x.alpha, SEE_THROUGH_SHADOW_CAP);
+        bind(x, p);
+        ++lastModelCasters;
+        ++lastModelCasterDraws;
+        ++lastTranslucentCasters;
+    }
+    if (bound)
+        ctx->PSSetShader(nullptr, nullptr, 0);
+    p.modelAmbient[3] = savedAlpha;
+}
+
+static void renderOpaqueModelCasters(Params &p);
 static void renderModelCasters(Params &p) {
+    renderOpaqueModelCasters(p);
+    renderTranslucentCasters(p);
+}
+static void renderOpaqueModelCasters(Params &p) {
     auto ordinary = [&] {
         for (const auto &x : draws)
-            if (!x.terrain && !x.lilyPad && intersectsMap(x, p)) {
+            if (!x.terrain && !x.lilyPad && x.alpha >= OPAQUE_ALPHA && intersectsMap(x, p)) {
                 bind(x, p);
                 ++lastModelCasters;
                 ++lastModelCasterDraws;

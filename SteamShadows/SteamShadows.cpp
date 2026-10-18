@@ -79,6 +79,10 @@ static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
 static bool cloudShadows = true, softShadows = false;
 static UINT resolution = 4096;
 static float radius = 120, strength = 1.f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
+// Share of the remaining (ambient, back and point) light also removed in a cast
+// shadow on a sun-facing surface, for deep, near-black cast shadows; 0 would
+// keep the native dark-side level.
+static float darkness = .55f;
 // Fade by distance from the camera (like Omega: zooming out shortens the
 // shadow reach) instead of by ground distance from the camera's map position.
 static bool cameraFade = true;
@@ -89,6 +93,7 @@ static ID3D11DeviceContext1 *ctx1 = nullptr;
 static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for our passes.
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
+static ID3D11PixelShader *translucentCaster = nullptr; // Dithered depth for see-through casters.
 // Direct-light receivers (used for all scene draws): the vertex shader also
 // estimates the native direct-sunlight share; terrain and models differ only
 // in their pixel shader (models add the receiver-plane filter).
@@ -200,7 +205,28 @@ struct Draw {
     float ambient[4] = {.3f, .3f, .3f, 0};
     float lightProtection = 0;
     float depthOffset = 0;
+    // Native pixel-shader alpha (b4): below 1 for see-through creatures, such
+    // as a rogue in stealth; they cast a proportionally lighter shadow.
+    float alpha = 1;
+    // A blended see-through model: it casts (dithered) but is never replayed as
+    // a receiver or drawn with the inline shaders.
+    bool casterOnly = false;
 };
+constexpr float OPAQUE_ALPHA = .99f, INVISIBLE_ALPHA = .05f;
+// A see-through caster (stealth) casts at most this share of a full shadow,
+// even while the game draws it nearly solid (moving). The 2x2 dither keeps
+// quarter steps, so .3 casts 25%.
+constexpr float SEE_THROUGH_SHADOW_CAP = .3f;
+// Diagnostics for see-through world draws (how the game fades e.g. a rogue
+// in stealth): logged with the periodic caster line.
+struct SeeThroughStats {
+    unsigned draws = 0, alphaUnread = 0, coverage = 0;
+    // Models (not unit-scale terrain/water) drawn see-through or blended.
+    unsigned faded = 0, unblendedSeeThrough = 0, blendedOpaque = 0, blendedFaint = 0,
+             blendedOther = 0;
+    float fadedMin = 1, fadedMax = 0;
+};
+static SeeThroughStats seeThrough;
 static std::vector<Draw> draws; // This frame's receivers.
 
 // A cloud cached in absolute world coordinates (clouds are often not drawn every
@@ -300,7 +326,7 @@ static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, las
             lastInlineModels = 0;
 static bool batchCastersEnabled = true;
 static bool tightTerrainBounds = true;
-static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0;
+static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0, lastTranslucentCasters = 0;
 static unsigned terrainCandidates = 0, terrainSubmissions = 0;
 static void initializeCasterBatches();
 static void clearTerrain() {
@@ -529,6 +555,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.config[3] = radius;
     p.sunTone[1] = fadeStart;
     p.sunTone[2] = cameraFade ? 1.f : 0.f;
+    p.sunTone[3] = darkness;
     if (g && g->world) {
         // Warm sunlight only by day, strongest when the sun is high.
         auto moonPhase = moonrules::state(g->world->state.time);
@@ -590,7 +617,7 @@ static void compactPointLights(Params &params) {
 //   visibility writes a second blend source that dims only that share. Models
 //   additionally compile with MODEL_PLANE_FILTER (receiver-plane filtering).
 // Params: config = (texel size, strength, bias, radius), eye.w = 2/depth span,
-// sun.w = soft shadows, sunTone = (warmth, fade start, camera fade), depthAdjust = (native
+// sun.w = soft shadows, sunTone = (warmth, fade start, camera fade, darkness), depthAdjust = (native
 // depth offset, small-entity flag, light count, light count valid),
 // nearLight = near-cascade light matrix, cascade = (near texel size, near
 // radius, blend start, near enabled), model* = native model lighting
@@ -623,6 +650,14 @@ V caster(float4 p:POSITION){
     o.p=mul(light,w);
     o.w=w.xyz;
     return o;
+}
+
+// See-through (stealth) model casters: a 2x2 ordered dither keeps a share
+// (modelAmbient.w, the native alpha) of their shadow-map texels. The comparison
+// filter's 2x2 footprint turns that into a proportionally lighter shadow.
+void translucentCaster(float4 p:SV_POSITION){
+    uint2 q=uint2(p.xy)&1;
+    clip(modelAmbient.w-(((q.x^q.y)*2+q.y)+.5)/4);
 }
 
 // Identical caster geometry and arithmetic, with this frame's transforms read
@@ -853,7 +888,9 @@ float4 visibility(V i):SV_TARGET{
     }
     // Preserve the native lantern color. Synthetic fill tied to shadow visibility
     // stamped a second colored silhouette into the illuminated ground.
-    float protection=max(local,lanternProtection);
+    // Like Omega, lantern and point light lighten a shadow (up to half of it)
+    // instead of removing it, so the shadow stays visible inside the light.
+    float protection=.5*max(local,lanternProtection);
     float alpha=opacity*(1-protection);
     float3 sunlight=float3(1,.65,.2)*sunTone.x*lit*fade*saturate(facing)*(1-local);
 #ifdef MODEL_DIRECT_LIGHT
@@ -861,7 +898,13 @@ float4 visibility(V i):SV_TARGET{
     // while the transmission factor attenuates only the native sunlight share.
     ModelOutput output;
     output.color=float4(sunlight,0);
-    output.transmission=float4(saturate(1-alpha*i.directFraction),1);
+    // Darkness (sunTone.w) also removes part of the remaining light, only on
+    // faces turned to the sun: faces turned away are on the native dark side
+    // already and must not darken everywhere.
+    // Only faces past the grazing band (exposure fades over facing .15-.30),
+    // where low visibility means a real occluder rather than the grazing shade.
+    float darkness=sunTone.w*smoothstep(.30,.45,facing);
+    output.transmission=float4(saturate(1-alpha*(i.directFraction+darkness*(1-i.directFraction))),1);
     return output;
 #else
     return float4(sunlight,alpha);
@@ -889,14 +932,17 @@ static bool initialize(ID3D11DeviceContext *context) {
     // (kept for the filtering tests), the direct-light receiver VS, the model
     // visibility PS and the terrain visibility PS (same source, different macros).
     const char *names[] = {"caster",     "receiver",   "visibility",
-                           "modelReceiverVertex", "visibility", "visibility"};
+                           "modelReceiverVertex", "visibility", "visibility",
+                           "translucentCaster"};
     const D3D_SHADER_MACRO modelMacros[] = {
         {"MODEL_PLANE_FILTER", "1"}, {"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
     const D3D_SHADER_MACRO terrainMacros[] = {{"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
-    for (int i = 0; i < 6 && ok; ++i) {
+    for (int i = 0; i < 7 && ok; ++i) {
         ID3DBlob *code = nullptr, *error = nullptr;
         bool vertexShader = i < 2 || i == 3;
-        const D3D_SHADER_MACRO *macros = i == 5 ? terrainMacros : i >= 3 ? modelMacros : nullptr;
+        const D3D_SHADER_MACRO *macros = i == 5 ? terrainMacros
+                                         : i == 3 || i == 4 ? modelMacros
+                                                            : nullptr;
         // The model pixel shader uses Texture2D.Gather, which needs shader model 4.1.
         const char *profile = vertexShader ? "vs_4_0" : i == 4 ? "ps_4_1" : "ps_4_0";
         HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", macros, nullptr, names[i],
@@ -916,7 +962,8 @@ static bool initialize(ID3D11DeviceContext *context) {
                                                           : &caster)
                     : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
                                                 nullptr,
-                                                i == 5   ? &terrainVisibility
+                                                i == 6   ? &translucentCaster
+                                                : i == 5 ? &terrainVisibility
                                                 : i == 4 ? &modelVisibility
                                                          : &visibility));
         if (ok && i == 0) {
@@ -1515,7 +1562,7 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     ID3D11PixelShader *bound = nullptr;
     lastReceivers = 0;
     for (auto &x : draws) {
-        if (x.inlined || beyondFade(x, p))
+        if (x.inlined || x.casterOnly || beyondFade(x, p))
             continue;
         ++lastReceivers;
         ID3D11PixelShader *shader = x.terrain ? terrainVisibility : modelVisibility;
@@ -1609,7 +1656,7 @@ static void render() {
     ctx->OMSetDepthStencilState(writeDepth, 0);
     Params receiverParameters = p;
     lastModelCasters = 0;
-    lastModelCasterDraws = lastBatchedCasters = 0;
+    lastModelCasterDraws = lastBatchedCasters = lastTranslucentCasters = 0;
     terrainCandidates = terrainSubmissions = 0;
     for (unsigned cascade = 0; cascade < (cascadesEnabled ? 2u : 1u); ++cascade) {
         if (cascade)
@@ -1637,17 +1684,28 @@ static void render() {
         (x.terrain ? lastInline : lastInlineModels) += x.inlined;
     frames++;
     if (frames == 1 || shot || frames % 600 == 0) {
-        char line[256];
+        char line[512];
         sprintf_s(line,
                   "Model caster submissions (both maps): %u objects -> %u draws; "
-                  "%u instances batched, BatchCasters=%d",
-                  lastModelCasters, lastModelCasterDraws, lastBatchedCasters, batchCastersEnabled);
+                  "%u instances batched, %u see-through (dithered), BatchCasters=%d",
+                  lastModelCasters, lastModelCasterDraws, lastBatchedCasters,
+                  lastTranslucentCasters, batchCastersEnabled);
         log(line);
         sprintf_s(line,
                   "Cached terrain caster submissions (both maps): %u candidates -> %u draws, "
                   "TightTerrainBounds=%d",
                   terrainCandidates, terrainSubmissions, tightTerrainBounds);
         log(line);
+        auto &t = seeThrough;
+        sprintf_s(line,
+                  "See-through models (since last line, of %u world draws): faded casters %u "
+                  "(alpha %.3f-%.3f), unblended see-through %u, skipped blended: opaque %u, "
+                  "invisible %u, other blend %u; alpha unread %u, alpha-to-coverage %u",
+                  t.draws, t.faded, t.faded ? t.fadedMin : 0.f, t.fadedMax,
+                  t.unblendedSeeThrough, t.blendedOpaque, t.blendedFaint, t.blendedOther,
+                  t.alphaUnread, t.coverage);
+        log(line);
+        t = {};
     }
     QueryPerformanceCounter(&end);
     totalMs += 1000. * (end.QuadPart - begin.QuadPart) / freq.QuadPart;
@@ -1724,26 +1782,32 @@ static bool nativeWorldBuffers(ID3D11Buffer *const buffers[6]) {
 }
 // Whether the bound blend state blends render target 0. Blend descriptions are
 // immutable; the last state is retained and its answer reused.
-static bool blendsTarget(ID3D11DeviceContext *c) {
+static bool blendsTarget(ID3D11DeviceContext *c, bool &coverage, float &factorAlpha,
+                         D3D11_BLEND_DESC &desc) {
     static ID3D11BlendState *last = nullptr;
-    static bool lastBlends = false, known = false;
+    static D3D11_BLEND_DESC lastDesc{};
+    static bool known = false;
     ID3D11BlendState *bs = nullptr;
     float factor[4];
     UINT mask;
     c->OMGetBlendState(&bs, factor, &mask);
     if (!known || bs != last) {
-        D3D11_BLEND_DESC bd{};
+        lastDesc = {};
+        lastDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        lastDesc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
         if (bs)
-            bs->GetDesc(&bd);
+            bs->GetDesc(&lastDesc);
         if (bs)
             bs->AddRef();
         drop(last);
         last = bs;
-        lastBlends = bd.RenderTarget[0].BlendEnable != FALSE;
         known = true;
     }
     drop(bs);
-    return lastBlends;
+    desc = lastDesc;
+    coverage = lastDesc.AlphaToCoverageEnable != FALSE;
+    factorAlpha = factor[3];
+    return lastDesc.RenderTarget[0].BlendEnable != FALSE;
 }
 
 // Called before every native draw. Records opaque world draws as shadow
@@ -1794,6 +1858,14 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     readBuffer(buffers[CB_MATERIAL], x.material, 16);
     for (auto &b : buffers)
         drop(b);
+    ID3D11Buffer *alphaBuffer = nullptr;
+    c->PSGetConstantBuffers(4, 1, &alphaBuffer);
+    float alphaValues[4] = {1, 1, 1, 1};
+    if (readBuffer(alphaBuffer, alphaValues, 16) && std::isfinite(alphaValues[0]))
+        x.alpha = std::clamp(alphaValues[0], 0.f, 1.f);
+    else
+        ++seeThrough.alphaUnread;
+    drop(alphaBuffer);
     if (!ok)
         return false;
     if (fabsf(x.proj[15]) > .5f) {
@@ -1823,10 +1895,42 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         log(s);
     }
     // Blended (transparent) draws are not shadow receivers.
-    if (blendsTarget(c)) {
+    bool coverage = false;
+    float factorAlpha = 1;
+    D3D11_BLEND_DESC blendDesc{};
+    bool blended = blendsTarget(c, coverage, factorAlpha, blendDesc);
+    ++seeThrough.draws;
+    seeThrough.coverage += coverage;
+    // The game fades see-through models (a rogue in stealth) with alpha
+    // blending. Such models still cast a shadow, lightened by their alpha;
+    // other blended draws (water, effects on unit-scale terrain) do not.
+    const auto &target0 = blendDesc.RenderTarget[0];
+    bool fadedModel = blended && !unit && x.alpha >= INVISIBLE_ALPHA && x.alpha < OPAQUE_ALPHA &&
+                      target0.SrcBlend == D3D11_BLEND_SRC_ALPHA &&
+                      target0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+    if (blended && !fadedModel && !unit) {
+        auto &t = seeThrough;
+        if (x.alpha >= OPAQUE_ALPHA)
+            ++t.blendedOpaque;
+        else if (x.alpha < INVISIBLE_ALPHA)
+            ++t.blendedFaint;
+        else
+            ++t.blendedOther;
+    }
+    if (blended && !fadedModel) {
         if (captureRequest.load() && diagnosticRejects++ < 8)
             log("Skipped blended scene draw.");
         return false;
+    }
+    x.casterOnly = fadedModel;
+    if (!unit) {
+        auto &t = seeThrough;
+        if (fadedModel) {
+            ++t.faded;
+            t.fadedMin = std::min(t.fadedMin, x.alpha);
+            t.fadedMax = std::max(t.fadedMax, x.alpha);
+        } else if (!blended && x.alpha < OPAQUE_ALPHA)
+            ++t.unblendedSeeThrough;
     }
     c->IAGetVertexBuffers(0, 1, &x.vb, &x.stride, &x.offset);
     c->IAGetIndexBuffer(&x.ib, &x.format, &x.ibOffset);
@@ -2004,7 +2108,7 @@ static bool staticModel(const Draw &x) {
 // it to the receiver pass).
 static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     if (!inlineTerrainEnabled || !inlineVS || !enabled || failed || internal || draws.empty() ||
-        draws.back().inlined)
+        draws.back().inlined || draws.back().casterOnly)
         return false;
     bool model = !draws.back().terrain;
     // Every model draw is remembered, so next frame can tell whether it moved.
@@ -2240,6 +2344,7 @@ static void loadSettings() {
     // from the sun in the unmodified game.
     strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 100, ini) * .01f;
     strength = strength < 0 ? 0 : strength > 1 ? 1 : strength;
+
 }
 using CreateVS = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const void *, SIZE_T,
                                              ID3D11ClassLinkage *, ID3D11VertexShader **);

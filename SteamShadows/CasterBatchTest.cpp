@@ -308,6 +308,26 @@ int main(int argc, char **argv) {
     p.light[15] = 1;
     auto overflow = renderDepth(p, true, false);
     assert(overflow.batched == 0 && overflow.calls == overflow.objects);
+    // See-through (stealth) casters keep about `alpha` of their shadow-map
+    // texels, capped (30% -> one texel in four); nearly invisible ones cast nothing.
+    draws.resize(64);
+    auto covered = [&](float alpha) {
+        for (auto &x : draws)
+            x.alpha = alpha;
+        auto image = renderDepth(p, true, false);
+        size_t n = 0;
+        for (auto d : image.depth)
+            n += d != 0x3f800000;
+        return n;
+    };
+    size_t full = covered(1), half = covered(.5f), quarter = covered(.25f), none = covered(.02f),
+           eighth = covered(.1f);
+    printf("  see-through casters: alpha 1 -> %zu texels, .5 -> %zu, .25 -> %zu, .02 -> %zu\n",
+           full, half, quarter, none);
+    assert(full > 1000 && none == 0);
+    assert(quarter > full * .15 && quarter < full * .35);
+    assert(half > full * .15 && half < full * .35); // capped
+    assert(eighth == 0);                             // below the first dither step
     draws.clear(); // Test draws borrowed references rather than retaining them.
     drop(floats);
     drop(bytes);

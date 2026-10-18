@@ -334,8 +334,11 @@ int main() {
          lantern = sampleLocal(false, true);
     assert(local[0] > unlit[0] + 20);
     assert(lantern[0] > unlit[0] + 20);
-    for (int channel = 0; channel < 3; channel++)
-        assert(lantern[channel] >= 253);
+    // Like Omega, the lantern lightens the shadow but leaves it visible.
+    auto lanternLit = sampleLocal(false, true, false, 4, true);
+    printf("Lantern in shadow: unlit %d, lantern %d, lantern outside shadow %d\n", unlit[0],
+           lantern[0], lanternLit[0]);
+    assert(lantern[0] < lanternLit[0] - 10);
     for (int face = 0; face < 6; face++) {
         auto side = sampleLocal(false, false, false, face);
         assert(side[0] < 200);
@@ -354,8 +357,9 @@ int main() {
     auto entityShadow = sampleLocal(false, false, false, 4, false, true);
     auto entityLit = sampleLocal(false, false, false, 4, true, true);
     auto entityLantern = sampleLocal(false, true, false, 4, false, true);
-    assert(entityShadow[0] < 200 && entityLit[0] > 240 && entityLantern[0] >= 253);
-    puts("Entity bias retains occluder shadows and lantern illumination: PASS");
+    assert(entityShadow[0] < 200 && entityLit[0] > 240 && entityLantern[0] > entityShadow[0] + 20 &&
+           entityLantern[0] < entityLit[0] - 10);
+    puts("Entity bias retains occluder shadows; the lantern lightens without removing them: PASS");
     auto warmPixel = sampleLocal(false, false, true);
     assert(warmPixel[0] > 135);
     assert(warmPixel[0] > warmPixel[2] + 8);
@@ -370,10 +374,18 @@ int main() {
     assert(cleanFace[0] > 240 && closeHair[0] < 200);
     puts(
         "Direct-world model: uniform clean face and 0.08-block sunlight contact shadow retained PASS");
+    float keptDarkness = shadows::darkness;
+    shadows::darkness = 0;
     auto ambientFace =
         sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
     assert(ambientFace[0] >= 253 && ambientFace[1] >= 253 && ambientFace[2] >= 253);
-    puts("Occluded model retains native ambient light when sunlight is absent: PASS");
+    shadows::darkness = keptDarkness;
+    auto darkFace =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
+    assert(darkFace[0] < ambientFace[0] - 60 && darkFace[1] < ambientFace[1] - 60);
+    printf("Occluded model: native ambient kept without darkness, deepened with it (%d -> %d): "
+           "PASS\n",
+           ambientFace[0], darkFace[0]);
 #endif
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
