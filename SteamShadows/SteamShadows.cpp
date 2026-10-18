@@ -208,6 +208,9 @@ struct Draw {
     // Native pixel-shader alpha (b4): below 1 for see-through creatures, such
     // as a rogue in stealth; they cast a proportionally lighter shadow.
     float alpha = 1;
+    // A blended see-through model: it casts (dithered) but is never replayed as
+    // a receiver or drawn with the inline shaders.
+    bool casterOnly = false;
 };
 constexpr float OPAQUE_ALPHA = .99f, INVISIBLE_ALPHA = .05f;
 // Diagnostics for see-through world draws (how the game fades e.g. a rogue
@@ -1553,7 +1556,7 @@ static void renderReceivers(Params &p, const D3D11_VIEWPORT &viewport) {
     ID3D11PixelShader *bound = nullptr;
     lastReceivers = 0;
     for (auto &x : draws) {
-        if (x.inlined || beyondFade(x, p))
+        if (x.inlined || x.casterOnly || beyondFade(x, p))
             continue;
         ++lastReceivers;
         ID3D11PixelShader *shader = x.terrain ? terrainVisibility : modelVisibility;
@@ -1900,11 +1903,19 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
         seeThrough.srcBlend = blendDesc.RenderTarget[0].SrcBlend;
         seeThrough.destBlend = blendDesc.RenderTarget[0].DestBlend;
     }
-    if (blended) {
+    // The game fades see-through models (a rogue in stealth) with alpha
+    // blending. Such models still cast a shadow, lightened by their alpha;
+    // other blended draws (water, effects on unit-scale terrain) do not.
+    const auto &target0 = blendDesc.RenderTarget[0];
+    bool fadedModel = blended && !unit && x.alpha >= INVISIBLE_ALPHA && x.alpha < OPAQUE_ALPHA &&
+                      target0.SrcBlend == D3D11_BLEND_SRC_ALPHA &&
+                      target0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+    if (blended && !fadedModel) {
         if (captureRequest.load() && diagnosticRejects++ < 8)
             log("Skipped blended scene draw.");
         return false;
     }
+    x.casterOnly = fadedModel;
     c->IAGetVertexBuffers(0, 1, &x.vb, &x.stride, &x.offset);
     c->IAGetIndexBuffer(&x.ib, &x.format, &x.ibOffset);
     c->IAGetInputLayout(&x.layout);
@@ -2081,7 +2092,7 @@ static bool staticModel(const Draw &x) {
 // it to the receiver pass).
 static bool drawInlineTerrain(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     if (!inlineTerrainEnabled || !inlineVS || !enabled || failed || internal || draws.empty() ||
-        draws.back().inlined)
+        draws.back().inlined || draws.back().casterOnly)
         return false;
     bool model = !draws.back().terrain;
     // Every model draw is remembered, so next frame can tell whether it moved.
