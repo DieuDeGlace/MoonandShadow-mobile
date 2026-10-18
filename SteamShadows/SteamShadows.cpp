@@ -213,12 +213,18 @@ struct Draw {
     bool casterOnly = false;
 };
 constexpr float OPAQUE_ALPHA = .99f, INVISIBLE_ALPHA = .05f;
+// A see-through caster (stealth) casts at most this share of a full shadow,
+// even while the game draws it nearly solid (moving). The 2x2 dither keeps
+// quarter steps, so .3 casts 25%.
+constexpr float SEE_THROUGH_SHADOW_CAP = .3f;
 // Diagnostics for see-through world draws (how the game fades e.g. a rogue
 // in stealth): logged with the periodic caster line.
 struct SeeThroughStats {
-    unsigned draws = 0, alphaUnread = 0, translucent = 0, blended = 0, coverage = 0;
-    float minAlpha = 1, minBlendedAlpha = 1, minFactor = 1;
-    int srcBlend = 0, destBlend = 0;
+    unsigned draws = 0, alphaUnread = 0, coverage = 0;
+    // Models (not unit-scale terrain/water) drawn see-through or blended.
+    unsigned faded = 0, unblendedSeeThrough = 0, blendedOpaque = 0, blendedFaint = 0,
+             blendedOther = 0;
+    float fadedMin = 1, fadedMax = 0;
 };
 static SeeThroughStats seeThrough;
 static std::vector<Draw> draws; // This frame's receivers.
@@ -1692,11 +1698,12 @@ static void render() {
         log(line);
         auto &t = seeThrough;
         sprintf_s(line,
-                  "See-through check (since last line): %u world draws, alpha unread %u, "
-                  "alpha<1 %u (min %.3f), alpha-to-coverage %u, blended (skipped) %u "
-                  "(min alpha %.3f, min blend factor %.3f, src %d dest %d)",
-                  t.draws, t.alphaUnread, t.translucent, t.minAlpha, t.coverage, t.blended,
-                  t.minBlendedAlpha, t.minFactor, t.srcBlend, t.destBlend);
+                  "See-through models (since last line, of %u world draws): faded casters %u "
+                  "(alpha %.3f-%.3f), unblended see-through %u, skipped blended: opaque %u, "
+                  "invisible %u, other blend %u; alpha unread %u, alpha-to-coverage %u",
+                  t.draws, t.faded, t.faded ? t.fadedMin : 0.f, t.fadedMax,
+                  t.unblendedSeeThrough, t.blendedOpaque, t.blendedFaint, t.blendedOther,
+                  t.alphaUnread, t.coverage);
         log(line);
         t = {};
     }
@@ -1894,15 +1901,6 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     bool blended = blendsTarget(c, coverage, factorAlpha, blendDesc);
     ++seeThrough.draws;
     seeThrough.coverage += coverage;
-    seeThrough.translucent += x.alpha < OPAQUE_ALPHA;
-    seeThrough.minAlpha = std::min(seeThrough.minAlpha, x.alpha);
-    if (blended) {
-        ++seeThrough.blended;
-        seeThrough.minBlendedAlpha = std::min(seeThrough.minBlendedAlpha, x.alpha);
-        seeThrough.minFactor = std::min(seeThrough.minFactor, factorAlpha);
-        seeThrough.srcBlend = blendDesc.RenderTarget[0].SrcBlend;
-        seeThrough.destBlend = blendDesc.RenderTarget[0].DestBlend;
-    }
     // The game fades see-through models (a rogue in stealth) with alpha
     // blending. Such models still cast a shadow, lightened by their alpha;
     // other blended draws (water, effects on unit-scale terrain) do not.
@@ -1910,12 +1908,30 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     bool fadedModel = blended && !unit && x.alpha >= INVISIBLE_ALPHA && x.alpha < OPAQUE_ALPHA &&
                       target0.SrcBlend == D3D11_BLEND_SRC_ALPHA &&
                       target0.DestBlend == D3D11_BLEND_INV_SRC_ALPHA;
+    if (blended && !fadedModel && !unit) {
+        auto &t = seeThrough;
+        if (x.alpha >= OPAQUE_ALPHA)
+            ++t.blendedOpaque;
+        else if (x.alpha < INVISIBLE_ALPHA)
+            ++t.blendedFaint;
+        else
+            ++t.blendedOther;
+    }
     if (blended && !fadedModel) {
         if (captureRequest.load() && diagnosticRejects++ < 8)
             log("Skipped blended scene draw.");
         return false;
     }
     x.casterOnly = fadedModel;
+    if (!unit) {
+        auto &t = seeThrough;
+        if (fadedModel) {
+            ++t.faded;
+            t.fadedMin = std::min(t.fadedMin, x.alpha);
+            t.fadedMax = std::max(t.fadedMax, x.alpha);
+        } else if (!blended && x.alpha < OPAQUE_ALPHA)
+            ++t.unblendedSeeThrough;
+    }
     c->IAGetVertexBuffers(0, 1, &x.vb, &x.stride, &x.offset);
     c->IAGetIndexBuffer(&x.ib, &x.format, &x.ibOffset);
     c->IAGetInputLayout(&x.layout);

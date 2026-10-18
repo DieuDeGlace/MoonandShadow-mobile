@@ -116,7 +116,8 @@ struct CasterPlan {
 static CasterPlan casterPlan;
 
 // See-through models (stealth): drawn after the opaque ones with the dithered
-// caster shader; nearly invisible ones cast nothing.
+// caster shader, at most SEE_THROUGH_SHADOW_CAP of a full shadow; nearly
+// invisible ones cast nothing.
 static void renderTranslucentCasters(Params &p) {
     bool bound = false;
     float savedAlpha = p.modelAmbient[3];
@@ -129,7 +130,7 @@ static void renderTranslucentCasters(Params &p) {
             ctx->PSSetConstantBuffers(0, 1, &constants);
             bound = true;
         }
-        p.modelAmbient[3] = x.alpha;
+        p.modelAmbient[3] = std::min(x.alpha, SEE_THROUGH_SHADOW_CAP);
         bind(x, p);
         ++lastModelCasters;
         ++lastModelCasterDraws;
