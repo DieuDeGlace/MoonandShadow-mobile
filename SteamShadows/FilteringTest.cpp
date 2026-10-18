@@ -380,12 +380,17 @@ int main() {
         sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
     assert(ambientFace[0] >= 253 && ambientFace[1] >= 253 && ambientFace[2] >= 253);
     shadows::darkness = keptDarkness;
-    auto darkFace =
+    // The model's own (near) shadow keeps the native level; something well
+    // above it (a tree) deepens the shadow.
+    auto selfFace =
         sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
+    auto darkFace =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, 4.f, true);
+    assert(selfFace[0] >= 253 && selfFace[1] >= 253 && selfFace[2] >= 253);
     assert(darkFace[0] < ambientFace[0] - 60 && darkFace[1] < ambientFace[1] - 60);
-    printf("Occluded model: native ambient kept without darkness, deepened with it (%d -> %d): "
-           "PASS\n",
-           ambientFace[0], darkFace[0]);
+    printf("Occluded model: native ambient kept for its own shadow (%d), deepened under a far "
+           "occluder (%d -> %d): PASS\n",
+           selfFace[0], ambientFace[0], darkFace[0]);
 #endif
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
