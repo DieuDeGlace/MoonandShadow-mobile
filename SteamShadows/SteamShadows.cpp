@@ -82,7 +82,7 @@ static float radius = 120, strength = 1.f, bias = .008f, sunWarmth = .03f, fadeS
 // Share of the remaining (ambient, back and point) light also removed in a cast
 // shadow on a sun-facing surface, for deep, near-black cast shadows; 0 would
 // keep the native dark-side level.
-static float darkness = .6f;
+static float darkness = .55f;
 // Fade by distance from the camera (like Omega: zooming out shortens the
 // shadow reach) instead of by ground distance from the camera's map position.
 static bool cameraFade = true;
