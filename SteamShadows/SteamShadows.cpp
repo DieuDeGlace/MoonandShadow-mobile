@@ -93,6 +93,7 @@ static ID3D11DeviceContext1 *ctx1 = nullptr;
 static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for our passes.
 static ID3D11VertexShader *caster = nullptr, *receiver = nullptr;
 static ID3D11PixelShader *visibility = nullptr, *modelVisibility = nullptr;
+static ID3D11PixelShader *translucentCaster = nullptr; // Dithered depth for see-through casters.
 // Direct-light receivers (used for all scene draws): the vertex shader also
 // estimates the native direct-sunlight share; terrain and models differ only
 // in their pixel shader (models add the receiver-plane filter).
@@ -204,7 +205,11 @@ struct Draw {
     float ambient[4] = {.3f, .3f, .3f, 0};
     float lightProtection = 0;
     float depthOffset = 0;
+    // Native pixel-shader alpha (b4): below 1 for see-through creatures, such
+    // as a rogue in stealth; they cast a proportionally lighter shadow.
+    float alpha = 1;
 };
+constexpr float OPAQUE_ALPHA = .99f, INVISIBLE_ALPHA = .05f;
 static std::vector<Draw> draws; // This frame's receivers.
 
 // A cloud cached in absolute world coordinates (clouds are often not drawn every
@@ -304,7 +309,7 @@ static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, las
             lastInlineModels = 0;
 static bool batchCastersEnabled = true;
 static bool tightTerrainBounds = true;
-static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0;
+static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0, lastTranslucentCasters = 0;
 static unsigned terrainCandidates = 0, terrainSubmissions = 0;
 static void initializeCasterBatches();
 static void clearTerrain() {
@@ -630,6 +635,14 @@ V caster(float4 p:POSITION){
     return o;
 }
 
+// See-through (stealth) model casters: a 2x2 ordered dither keeps a share
+// (modelAmbient.w, the native alpha) of their shadow-map texels. The comparison
+// filter's 2x2 footprint turns that into a proportionally lighter shadow.
+void translucentCaster(float4 p:SV_POSITION){
+    uint2 q=uint2(p.xy)&1;
+    clip(modelAmbient.w-(((q.x^q.y)*2+q.y)+.5)/4);
+}
+
 // Identical caster geometry and arithmetic, with this frame's transforms read
 // from a bounded instance table instead of re-uploading Params for every model.
 Buffer<float4> casterWorlds:register(t0);
@@ -900,14 +913,17 @@ static bool initialize(ID3D11DeviceContext *context) {
     // (kept for the filtering tests), the direct-light receiver VS, the model
     // visibility PS and the terrain visibility PS (same source, different macros).
     const char *names[] = {"caster",     "receiver",   "visibility",
-                           "modelReceiverVertex", "visibility", "visibility"};
+                           "modelReceiverVertex", "visibility", "visibility",
+                           "translucentCaster"};
     const D3D_SHADER_MACRO modelMacros[] = {
         {"MODEL_PLANE_FILTER", "1"}, {"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
     const D3D_SHADER_MACRO terrainMacros[] = {{"MODEL_DIRECT_LIGHT", "1"}, {nullptr, nullptr}};
-    for (int i = 0; i < 6 && ok; ++i) {
+    for (int i = 0; i < 7 && ok; ++i) {
         ID3DBlob *code = nullptr, *error = nullptr;
         bool vertexShader = i < 2 || i == 3;
-        const D3D_SHADER_MACRO *macros = i == 5 ? terrainMacros : i >= 3 ? modelMacros : nullptr;
+        const D3D_SHADER_MACRO *macros = i == 5 ? terrainMacros
+                                         : i == 3 || i == 4 ? modelMacros
+                                                            : nullptr;
         // The model pixel shader uses Texture2D.Gather, which needs shader model 4.1.
         const char *profile = vertexShader ? "vs_4_0" : i == 4 ? "ps_4_1" : "ps_4_0";
         HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "SteamShadows", macros, nullptr, names[i],
@@ -927,7 +943,8 @@ static bool initialize(ID3D11DeviceContext *context) {
                                                           : &caster)
                     : device->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(),
                                                 nullptr,
-                                                i == 5   ? &terrainVisibility
+                                                i == 6   ? &translucentCaster
+                                                : i == 5 ? &terrainVisibility
                                                 : i == 4 ? &modelVisibility
                                                          : &visibility));
         if (ok && i == 0) {
@@ -1620,7 +1637,7 @@ static void render() {
     ctx->OMSetDepthStencilState(writeDepth, 0);
     Params receiverParameters = p;
     lastModelCasters = 0;
-    lastModelCasterDraws = lastBatchedCasters = 0;
+    lastModelCasterDraws = lastBatchedCasters = lastTranslucentCasters = 0;
     terrainCandidates = terrainSubmissions = 0;
     for (unsigned cascade = 0; cascade < (cascadesEnabled ? 2u : 1u); ++cascade) {
         if (cascade)
@@ -1651,8 +1668,9 @@ static void render() {
         char line[256];
         sprintf_s(line,
                   "Model caster submissions (both maps): %u objects -> %u draws; "
-                  "%u instances batched, BatchCasters=%d",
-                  lastModelCasters, lastModelCasterDraws, lastBatchedCasters, batchCastersEnabled);
+                  "%u instances batched, %u see-through (dithered), BatchCasters=%d",
+                  lastModelCasters, lastModelCasterDraws, lastBatchedCasters,
+                  lastTranslucentCasters, batchCastersEnabled);
         log(line);
         sprintf_s(line,
                   "Cached terrain caster submissions (both maps): %u candidates -> %u draws, "
@@ -1805,6 +1823,12 @@ static bool record(ID3D11DeviceContext *c, UINT count, UINT start, INT base, boo
     readBuffer(buffers[CB_MATERIAL], x.material, 16);
     for (auto &b : buffers)
         drop(b);
+    ID3D11Buffer *alphaBuffer = nullptr;
+    c->PSGetConstantBuffers(4, 1, &alphaBuffer);
+    float alphaValues[4] = {1, 1, 1, 1};
+    if (readBuffer(alphaBuffer, alphaValues, 16) && std::isfinite(alphaValues[0]))
+        x.alpha = std::clamp(alphaValues[0], 0.f, 1.f);
+    drop(alphaBuffer);
     if (!ok)
         return false;
     if (fabsf(x.proj[15]) > .5f) {
