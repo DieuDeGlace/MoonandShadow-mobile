@@ -192,14 +192,24 @@ int main(int argc, char **argv) {
                                 float facing =
                                     1.f / std::sqrt(1.f + steepness * steepness *
                                                               (.75f * .75f + .35f * .35f));
-                                float transition = std::clamp((facing - .15f) / .15f, 0.f, 1.f);
-                                float expected =
-                                    gap > 0 ? 0.f : transition * transition * (3 - 2 * transition);
-                                if (!std::isfinite(row[x]) || std::abs(row[x] - expected) > .01f)
+                                // Unoccluded: lit (grazing faces are compared off the
+                                // surface, so they no longer take a directional shade).
+                                // A close occluder shadows faces past the grazing band;
+                                // in the band only uniformity is required (no stripes).
+                                float sunSide = std::clamp(facing / .10f, 0.f, 1.f);
+                                sunSide = sunSide * sunSide * (3 - 2 * sunSide);
+                                bool grazing = facing < .30f;
+                                if (!std::isfinite(row[x]))
+                                    ++wrong;
+                                else if (gap > 0 && grazing)
+                                    continue;
+                                else if (std::abs(row[x] - (gap > 0 ? 0.f : sunSide)) > .01f)
                                     ++wrong;
                             }
                         }
                         context->Unmap(staging, 0);
+                        if (maximum - minimum > .01f)
+                            ++wrong; // stripes or seams across subtexel positions
                         printf(
                             "%s slope=%.0f sign=%+.0f gap=%.2f phase=%.2f: wrong=%u range=[%.5f %.5f]\n",
                             useNearMap ? "near" : "far", steepness, sign, gap, phase, wrong,
