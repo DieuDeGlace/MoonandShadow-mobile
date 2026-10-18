@@ -79,6 +79,10 @@ static std::atomic<int> toggleRequest{0}, captureRequest{0}, disableRequest{0};
 static bool cloudShadows = true, softShadows = false;
 static UINT resolution = 4096;
 static float radius = 120, strength = 1.f, bias = .008f, sunWarmth = .03f, fadeStart = .4f;
+// Share of the remaining (ambient, back and point) light also removed in a cast
+// shadow on a sun-facing surface, for deep, near-black cast shadows; 0 would
+// keep the native dark-side level.
+static float darkness = .6f;
 // Fade by distance from the camera (like Omega: zooming out shortens the
 // shadow reach) instead of by ground distance from the camera's map position.
 static bool cameraFade = true;
@@ -529,6 +533,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.config[3] = radius;
     p.sunTone[1] = fadeStart;
     p.sunTone[2] = cameraFade ? 1.f : 0.f;
+    p.sunTone[3] = darkness;
     if (g && g->world) {
         // Warm sunlight only by day, strongest when the sun is high.
         auto moonPhase = moonrules::state(g->world->state.time);
@@ -590,7 +595,7 @@ static void compactPointLights(Params &params) {
 //   visibility writes a second blend source that dims only that share. Models
 //   additionally compile with MODEL_PLANE_FILTER (receiver-plane filtering).
 // Params: config = (texel size, strength, bias, radius), eye.w = 2/depth span,
-// sun.w = soft shadows, sunTone = (warmth, fade start, camera fade), depthAdjust = (native
+// sun.w = soft shadows, sunTone = (warmth, fade start, camera fade, darkness), depthAdjust = (native
 // depth offset, small-entity flag, light count, light count valid),
 // nearLight = near-cascade light matrix, cascade = (near texel size, near
 // radius, blend start, near enabled), model* = native model lighting
@@ -861,7 +866,11 @@ float4 visibility(V i):SV_TARGET{
     // while the transmission factor attenuates only the native sunlight share.
     ModelOutput output;
     output.color=float4(sunlight,0);
-    output.transmission=float4(saturate(1-alpha*i.directFraction),1);
+    // Darkness (sunTone.w) also removes part of the remaining light, only on
+    // faces turned to the sun: faces turned away are on the native dark side
+    // already and must not darken everywhere.
+    float darkness=sunTone.w*smoothstep(.05,.25,facing);
+    output.transmission=float4(saturate(1-alpha*(i.directFraction+darkness*(1-i.directFraction))),1);
     return output;
 #else
     return float4(sunlight,alpha);
@@ -2240,6 +2249,7 @@ static void loadSettings() {
     // from the sun in the unmodified game.
     strength = GetPrivateProfileIntW(L"Shadows", L"StrengthPercent", 100, ini) * .01f;
     strength = strength < 0 ? 0 : strength > 1 ? 1 : strength;
+
 }
 using CreateVS = HRESULT(STDMETHODCALLTYPE *)(ID3D11Device *, const void *, SIZE_T,
                                              ID3D11ClassLinkage *, ID3D11VertexShader **);

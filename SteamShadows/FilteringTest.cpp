@@ -370,10 +370,18 @@ int main() {
     assert(cleanFace[0] > 240 && closeHair[0] < 200);
     puts(
         "Direct-world model: uniform clean face and 0.08-block sunlight contact shadow retained PASS");
+    float keptDarkness = shadows::darkness;
+    shadows::darkness = 0;
     auto ambientFace =
         sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
     assert(ambientFace[0] >= 253 && ambientFace[1] >= 253 && ambientFace[2] >= 253);
-    puts("Occluded model retains native ambient light when sunlight is absent: PASS");
+    shadows::darkness = keptDarkness;
+    auto darkFace =
+        sampleLocal(false, false, false, 4, false, true, true, false, false, true, .08f, true);
+    assert(darkFace[0] < ambientFace[0] - 60 && darkFace[1] < ambientFace[1] - 60);
+    printf("Occluded model: native ambient kept without darkness, deepened with it (%d -> %d): "
+           "PASS\n",
+           ambientFace[0], darkFace[0]);
 #endif
     // A slanted light on a plane with no occluder must not stripe its own surface.
     shadows::clearClouds();
