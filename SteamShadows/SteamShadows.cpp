@@ -762,33 +762,50 @@ bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float t
 }
 
 float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
-    // At noon the light grazes vertical voxel faces. Their shadow projection
-    // is thinner than a texel, so nearby faces can alternate across the filter
-    // footprint. Give those faces one consistent directional shade instead.
-    // Native ambient/back/local light is retained by the model blend below.
-    float facing = dot(normalize(i.n), sun.xyz);
-    float exposure = smoothstep(.15, .30, facing);
-    [branch] if (exposure <= 0)
+    // Faces turned away from the sun keep one consistent directional shade
+    // (native ambient/back/local light is retained by the model blend below).
+    // At noon the light grazes vertical and sloped voxel faces: their shadow
+    // projection is thinner than a texel, so comparing at the surface lets a
+    // face shadow itself in stripes. Grazing faces are compared from a point
+    // two texels off the surface along the normal instead, where only real
+    // occluders (other hair steps, trees) can block the sun.
+    float3 n = normalize(i.n);
+    float facing = dot(n, sun.xyz);
+    float sunSide = smoothstep(0, .10, facing);
+    [branch] if (sunSide <= 0)
         return 0;
     if (!modelMapCovered(i.w, transform, region.x))
-        return exposure;
-    float3 p = mul(transform, float4(i.w, 1)).xyz;
-    float2 uv = float2(p.x, -p.y) * .5 + .5;
-    // Signed plane gradient in shadow UV coordinates. The orthographic rows
-    // carry their own scale; eye.w is twice the inverse light-depth span.
-    float denominator = dot(i.n, transform[2].xyz);
-    denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
-    float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
-    float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
-    float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
-    [branch] if (sun.w > .5) {
-        float lit = 0;
-        [unroll] for (int y = -1; y <= 1; y++)
-            [unroll] for (int x = -1; x <= 1; x++)
-                lit += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
-        return exposure * lit / 9;
+        return sunSide;
+    float exposure = smoothstep(.15, .30, facing);
+    float lit = 0;
+    [branch] if (exposure < 1) {
+        float texelWorld = region.x * 2 / max(length(transform[0].xyz), 1e-6);
+        float3 q = mul(transform, float4(i.w + n * texelWorld * 2, 1)).xyz;
+        float2 quv = float2(q.x, -q.y) * .5 + .5;
+        float grazing = planeComparison(map, quv, q.z, 0, region.x, region.z * 3, 0);
+        lit += (1 - exposure) * grazing;
     }
-    return exposure * planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+    [branch] if (exposure > 0) {
+        float3 p = mul(transform, float4(i.w, 1)).xyz;
+        float2 uv = float2(p.x, -p.y) * .5 + .5;
+        // Signed plane gradient in shadow UV coordinates. The orthographic rows
+        // carry their own scale; eye.w is twice the inverse light-depth span.
+        float denominator = dot(i.n, transform[2].xyz);
+        denominator = (denominator < 0 ? -1 : 1) * max(abs(denominator), eye.w * .0005);
+        float factor = region.w * region.w * eye.w * eye.w * .5 / denominator;
+        float2 gradient = float2(-dot(i.n, transform[0].xyz), dot(i.n, transform[1].xyz)) * factor;
+        float baseBias = region.z * (1 + 2 * (1 - saturate(facing)));
+        float plane = 0;
+        [branch] if (sun.w > .5) {
+            [unroll] for (int y = -1; y <= 1; y++)
+                [unroll] for (int x = -1; x <= 1; x++)
+                    plane += planeComparison(map, uv, p.z, gradient, region.x, baseBias, float2(x, y));
+            plane /= 9;
+        } else
+            plane = planeComparison(map, uv, p.z, gradient, region.x, baseBias, 0);
+        lit += exposure * plane;
+    }
+    return sunSide * lit;
 }
 #endif
 
