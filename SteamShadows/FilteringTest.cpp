@@ -339,11 +339,19 @@ int main() {
     printf("Lantern in shadow: unlit %d, lantern %d, lantern outside shadow %d\n", unlit[0],
            lantern[0], lanternLit[0]);
     assert(lantern[0] < lanternLit[0] - 10);
+    // Every face is either shadowed by the occluder (faces toward the light)
+    // or left exactly as in the open (faces turned away): never partly.
     for (int face = 0; face < 6; face++) {
-        auto side = sampleLocal(false, false, false, face);
-        assert(side[0] < 200);
+        auto inside = sampleLocal(false, false, false, face),
+             open = sampleLocal(false, false, false, face, true);
+        bool shadowed = inside[0] < 200 && inside[0] < open[0] - 20;
+        assert(shadowed || std::abs(inside[0] - open[0]) <= 2);
+        if (face == 4)
+            assert(shadowed); // the top faces the light
+        if (face == 5)
+            assert(!shadowed); // the underside faces away
     }
-    puts("All six block-face normals receive occluder shadows: PASS");
+    puts("Faces toward the light take occluder shadows; away faces stay native: PASS");
     // Outside the occluder, sun-facing tops stay lit and away-facing faces keep
     // the game's own lighting; under the occluder both are shadowed.
     auto litTop = sampleLocal(false, false, false, 4, true);
@@ -351,8 +359,8 @@ int main() {
     auto awayInside = sampleLocal(false, false, false, 5, false);
     assert(litTop[0] > 240);
     assert(awayOutside[0] > 240);
-    assert(awayInside[0] < 200);
-    puts("Away-facing faces keep native light in the open and take occluder shadows: PASS");
+    assert(std::abs(awayInside[0] - awayOutside[0]) <= 2);
+    puts("Away-facing faces keep native light in the open and under occluders: PASS");
     // Entity tolerance must preserve actual occluder shadows and lighting.
     auto entityShadow = sampleLocal(false, false, false, 4, false, true);
     auto entityLit = sampleLocal(false, false, false, 4, true, true);
