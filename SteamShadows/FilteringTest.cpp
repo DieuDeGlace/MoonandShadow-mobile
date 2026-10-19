@@ -344,15 +344,15 @@ int main() {
         assert(side[0] < 200);
     }
     puts("All six block-face normals receive occluder shadows: PASS");
-    // Outside the occluder, sun-facing tops stay lit while away-facing sides
-    // retain the same directional shade as inside the occluder.
+    // Outside the occluder, sun-facing tops stay lit and away-facing faces keep
+    // the game's own lighting; under the occluder both are shadowed.
     auto litTop = sampleLocal(false, false, false, 4, true);
     auto awayOutside = sampleLocal(false, false, false, 5, true);
     auto awayInside = sampleLocal(false, false, false, 5, false);
     assert(litTop[0] > 240);
-    assert(awayOutside[0] < 200);
-    assert(abs(awayOutside[0] - awayInside[0]) <= 2);
-    puts("Away-facing shade stays consistent across caster boundaries: PASS");
+    assert(awayOutside[0] > 240);
+    assert(awayInside[0] < 200);
+    puts("Away-facing faces keep native light in the open and take occluder shadows: PASS");
     // Entity tolerance must preserve actual occluder shadows and lighting.
     auto entityShadow = sampleLocal(false, false, false, 4, false, true);
     auto entityLit = sampleLocal(false, false, false, 4, true, true);
