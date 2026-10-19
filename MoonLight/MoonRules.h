@@ -100,16 +100,40 @@ struct ShadowCycle {
 inline float horizonFade(float z) {
     return smooth((z - .08f) / .22f);
 }
+// Like Omega, shadows keep going down to the horizon and then flip to the other
+// light (sun <-> moon). Strength only crossfades in the few game minutes either
+// side of the crossing (zero exactly at it), so the flip does not pop.
+inline float flipFade(float z) {
+    return smooth(std::fabs(z) / .04f);
+}
+// Lowest elevation shadows are cast from (sin, about 10 degrees): near the
+// horizon they stay long (about five times an object's height) instead of
+// stretching without end.
+constexpr float MIN_CAST_ELEVATION = .18f;
+inline void castingDirection(float d[3]) {
+    if (d[2] >= MIN_CAST_ELEVATION)
+        return;
+    float horizontal = std::sqrt(d[0] * d[0] + d[1] * d[1]);
+    if (horizontal < 1e-6f) {
+        d[0] = d[1] = 0;
+        d[2] = 1;
+        return;
+    }
+    float scale = std::sqrt(1 - MIN_CAST_ELEVATION * MIN_CAST_ELEVATION) / horizontal;
+    d[0] *= scale;
+    d[1] *= scale;
+    d[2] = MIN_CAST_ELEVATION;
+}
 // Which light casts shadows: the sun while it is above the horizon, otherwise
-// the moon; strength fades out near the horizon.
+// the moon (at full night strength from the flip on).
 inline ShadowCycle shadows(float milliseconds, float dayStrength, float nightStrength) {
     auto moon = state(milliseconds, nightStrength);
     ShadowCycle out;
     bool day = moon.direction[2] < 0;
     for (int i = 0; i < 3; i++)
         out.direction[i] = day ? -moon.direction[i] : moon.direction[i];
-    float horizon = horizonFade(out.direction[2]);
-    out.strength = day ? dayStrength * horizon : nightStrength * moon.weight * horizon;
+    out.strength = (day ? dayStrength : nightStrength) * flipFade(out.direction[2]);
+    castingDirection(out.direction);
     return out;
 }
 } // namespace moonrules

@@ -38,18 +38,21 @@ int main() {
          midnight = moonrules::shadows(0, .6f, .2f);
     assert(std::abs(midday.strength - .6f) < 1e-5 && std::abs(midnight.strength - .2f) < 1e-5);
     assert(midday.direction[2] > .99 && midnight.direction[2] > .99);
-    // Full strength through the afternoon; fading out over the last 1.5 hours.
-    auto afternoonLate = moonrules::shadows(16.5f * 3600000.f, .6f, .2f),
-         evening = moonrules::shadows(17.5f * 3600000.f, .6f, .2f),
-         dusk = moonrules::shadows(18 * 3600000.f, .6f, .2f);
-    assert(std::abs(afternoonLate.strength - midday.strength) < 1e-3);
-    assert(evening.strength > 0 && evening.strength < midday.strength && dusk.strength < 1e-6);
+    // Omega-like: full strength down to the horizon (long shadows from at least
+    // MIN_CAST_ELEVATION), a short crossfade, then the moon (or sun) at once.
+    for (float hour : {16.5f, 17.5f, 17.75f, 18.25f, 19.f, 5.f, 5.75f, 6.25f, 6.5f}) {
+        auto s = moonrules::shadows(hour * 3600000.f, .6f, .2f);
+        bool day = hour > 6 && hour < 18;
+        assert(std::abs(s.strength - (day ? .6f : .2f)) < 1e-3);
+        assert(s.direction[2] >= moonrules::MIN_CAST_ELEVATION - 1e-5);
+    }
+    assert(moonrules::shadows(18 * 3600000.f, .6f, .2f).strength < 1e-6);
+    assert(moonrules::shadows(6 * 3600000.f, .6f, .2f).strength < 1e-6);
     assert(moonrules::shadows(0, .6f, 0).strength == 0);
-    // No shadows at all while the sun or moon is at the horizon (dusk and dawn).
-    for (float hour : {17.75f, 17.9f, 18.f, 18.1f, 18.25f, 5.75f, 5.9f, 6.f, 6.1f, 6.25f})
-        assert(moonrules::shadows(hour * 3600000.f, .6f, .2f).strength == 0);
-    assert(moonrules::shadows(17.6f * 3600000.f, .6f, .2f).strength > 0);
-    assert(moonrules::shadows(6.5f * 3600000.f, .6f, .2f).strength > 0);
+    // The flip: the shadow-casting light swaps sides of the sky at dusk and dawn.
+    auto beforeDusk = moonrules::shadows(17.9f * 3600000.f, .6f, .2f),
+         afterDusk = moonrules::shadows(18.1f * 3600000.f, .6f, .2f);
+    assert(beforeDusk.direction[0] * afterDusk.direction[0] < 0);
     // The moonlit light direction turns gradually at moonrise and moonset, even
     // from a native direction opposite the rising moon.
     const float natives[][3] = {{0, 0, 1}, {-.94f, -.341f, 0}, {.6f, 0, -.8f}};
@@ -71,7 +74,8 @@ int main() {
     for (int minute = 1; minute < 1440; minute++) {
         auto a = moonrules::shadows((minute - 1) * 60000.f, .6f, .2f),
              b = moonrules::shadows(minute * 60000.f, .6f, .2f);
-        assert(std::abs(a.strength - b.strength) < .02f); // No visible step per game minute.
+        // A brief crossfade at the flip (zero only at the horizon), never a pop.
+        assert(std::abs(a.strength - b.strength) < .12f);
     }
     puts(
         "Subtle brightness limits, unchanged daytime/alpha, normalized moon direction, smooth dawn/dusk and night-only cloud dimming: PASS");

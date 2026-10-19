@@ -517,12 +517,16 @@ static bool lightMatrix(Params &p, const Draw &d) {
         // follow the native direction while it is above the horizon.
         bool day = moonrules::state(g->world->state.time).direction[2] < 0;
         if (sunFromGame && day && native.z > .02f) {
-            sun = native;
-            activeStrength = strength * moonrules::horizonFade(native.z);
+            float cast[3] = {native.x, native.y, native.z};
+            moonrules::castingDirection(cast);
+            sun = {cast[0], cast[1], cast[2]};
+            activeStrength = strength * moonrules::flipFade(native.z);
         }
     } else if (moonEnabled) {
-        sun = norm({moon.direction[0], moon.direction[1], moon.direction[2]});
-        activeStrength = moon.shadowStrength * moon.weight * moonrules::horizonFade(sun.z);
+        float cast[3] = {moon.direction[0], moon.direction[1], moon.direction[2]};
+        activeStrength = moon.shadowStrength * moonrules::flipFade(cast[2]);
+        moonrules::castingDirection(cast);
+        sun = norm({cast[0], cast[1], cast[2]});
     }
     if (captureRequest.load() == 2) // PreviewSteamShadows: a fixed high sun.
         sun = norm({.5f, .25f, .8f});
@@ -549,7 +553,7 @@ static bool lightMatrix(Params &p, const Draw &d) {
     p.sun[2] = sun.z;
     p.sun[3] = softShadows ? 1.f : 0.f;
     p.config[0] = 1.f / resolution;
-    // Already faded near the horizon (moonrules::horizonFade).
+    // Already crossfaded at the sun/moon flip (moonrules::flipFade).
     p.config[1] = activeStrength;
     p.config[2] = bias / span;
     p.config[3] = radius;
