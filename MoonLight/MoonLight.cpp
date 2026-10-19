@@ -67,6 +67,9 @@ static D oldD;
 static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
+// Combined build: SteamShadows shares these Map/Update hooks and is told here
+// of writes to any other resource (its measured mesh bounds depend on them).
+static void (*bufferWritten)(ID3D11Resource *) = nullptr;
 static void **table = nullptr; // Hooked context vtable (set once attached).
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
@@ -451,6 +454,8 @@ static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, 
         UINT n = bytes(r);
         if (n)
             mapped[r] = {m->pData, n};
+        else if (bufferWritten)
+            bufferWritten(r);
     }
     return hr;
 }
@@ -464,11 +469,11 @@ static void STDMETHODCALLTYPE unmap(ID3D11DeviceContext *c, ID3D11Resource *r, U
 }
 static void STDMETHODCALLTYPE update(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub,
                                      const D3D11_BOX *box, const void *data, UINT row, UINT slice) {
-    if (!internal && sub == 0 && !box && data) {
-        UINT n = bytes(r);
-        if (n)
-            r->SetPrivateData(cacheGuid, n, data);
-    }
+    UINT n = internal ? 0 : bytes(r);
+    if (!internal && sub == 0 && !box && data && n)
+        r->SetPrivateData(cacheGuid, n, data);
+    if (!internal && !n && bufferWritten)
+        bufferWritten(r);
     oldUpdate(c, r, sub, box, data, row, slice);
 }
 static bool patch(void **slot, void *fn) {
