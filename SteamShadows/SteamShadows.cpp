@@ -769,9 +769,7 @@ bool modelMapCovered(float3 worldPosition, row_major float4x4 transform, float t
 // blocks) above the face blocks the sun, i.e. any shadow is the model's own.
 static float modelFarLit = 1;
 float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Texture2D<float> map) {
-    // Faces turned away from the sun keep the game's own lighting: the model
-    // itself (within FAR_OCCLUDER of the face) never counts as their shadow,
-    // only something well above it, like a tree canopy. At noon the light grazes vertical and sloped voxel faces: their shadow
+    // Faces turned away from the sun keep the game's own lighting. At noon the light grazes vertical and sloped voxel faces: their shadow
     // projection is thinner than a texel, so comparing at the surface lets a
     // face shadow itself in stripes. Grazing faces are compared from a point
     // two texels off the surface along the normal instead, where only real
@@ -790,7 +788,9 @@ float modelPlaneVisibility(V i, row_major float4x4 transform, float4 region, Tex
         float farBias = 2.5 * length(transform[2].xyz);
         modelFarLit = planeComparison(map, uv, p.z, 0, region.x, farBias, 0);
     }
-    float away = modelFarLit;
+    // Away-facing faces always keep the game's own dark side (no patches where
+    // a distant occluder's shadow would cross them).
+    const float away = 1;
     [branch] if (sunSide <= 0)
         return away;
     float exposure = smoothstep(.15, .30, facing);
@@ -845,13 +845,11 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
     // with different exposure (cliff edges), where they would be undefined.
     float2 ux=ddx(uv),uy=ddy(uv);
     float zx=ddx(p.z),zy=ddy(p.z);
-    // Faces turned away from the sun keep the game's own lighting (it still
-    // gives them a little light), unless something more than 2.5 blocks above
-    // blocks the sun: with a low sun at dusk, terrain sides were darker than tops.
+    // Faces turned away from the light are on the game's own dark side; a cast
+    // shadow on them would only show as patches where it removes the native
+    // light, so they always keep the game's lighting.
     float sunSide=depthAdjust.y>0?1:smoothstep(0,.10,facing);
-    float away=1;
-    [branch]if(sunSide<1&&all(uv>=region.x)&&all(uv<=1-region.x)&&p.z>=0&&p.z<=1)
-        away=map.SampleCmpLevelZero(shadowSampler,uv,p.z-2.5*length(lightTransform[2].xyz));
+    const float away=1;
     [branch]if(exposure<=0)return lerp(away,0,sunSide);
     float det=ux.x*uy.y-ux.y*uy.x;
     float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
