@@ -845,12 +845,19 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
     // with different exposure (cliff edges), where they would be undefined.
     float2 ux=ddx(uv),uy=ddy(uv);
     float zx=ddx(p.z),zy=ddy(p.z);
-    [branch]if(exposure<=0)return 0;
+    // Faces turned away from the sun keep the game's own lighting (it still
+    // gives them a little light), unless something more than 2.5 blocks above
+    // blocks the sun: with a low sun at dusk, terrain sides were darker than tops.
+    float sunSide=depthAdjust.y>0?1:smoothstep(0,.10,facing);
+    float away=1;
+    [branch]if(sunSide<1&&all(uv>=region.x)&&all(uv<=1-region.x)&&p.z>=0&&p.z<=1)
+        away=map.SampleCmpLevelZero(shadowSampler,uv,p.z-2.5*length(lightTransform[2].xyz));
+    [branch]if(exposure<=0)return lerp(away,0,sunSide);
     float det=ux.x*uy.y-ux.y*uy.x;
     float slope=sqrt(saturate(1-facing*facing))/max(abs(facing),.1);
     float footprint=region.x*region.w*eye.w*min(slope,8);
     if(abs(det)>1e-12){float2 gradient=float2(zx*uy.y-zy*ux.y,zy*ux.x-zx*uy.x)/det;footprint=region.x*(abs(gradient.x)+abs(gradient.y));}
-    if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return 0;
+    if(any(uv<region.x)||any(uv>1-region.x)||p.z<0||p.z>1)return lerp(away,0,sunSide);
     // Small sprite faces need a stable normal-derived footprint. Screen
     // derivatives can mix adjacent faces across a pixel quad on these models.
     // Slope-scaled base bias (as models use) for faces just past the grazing band.
@@ -868,7 +875,7 @@ float shadowVisibility(V i,row_major float4x4 lightTransform,float4 region,Textu
     }else lit=map.SampleCmpLevelZero(shadowSampler,uv,p.z-bias);
     // Faces turned away or grazing have little or no direct contribution; this
     // also keeps their own depth samples from producing bright edge teeth.
-    return lit*exposure;
+    return lerp(away,lit*exposure,sunSide);
 #endif
 }
 
