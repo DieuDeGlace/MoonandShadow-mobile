@@ -57,6 +57,7 @@ static void log(const char *s) {
 
 // ID3D11DeviceContext vtable slots.
 constexpr UINT SLOT_DRAW_INDEXED = 12, SLOT_DRAW = 13, SLOT_MAP = 14, SLOT_UNMAP = 15,
+               SLOT_COPY_SUBRESOURCE_REGION = 46, SLOT_COPY_RESOURCE = 47,
                SLOT_UPDATE_SUBRESOURCE = 48, SLOT_CLEAR_DEPTH_STENCIL_VIEW = 53;
 // Vertex-shader constant buffer slots of a native world draw.
 constexpr UINT CB_PROJECTION = 0, CB_VIEW = 1, CB_WORLD = 2, CB_MATERIAL = 3, CB_POINT_LIGHTS = 4,
@@ -155,12 +156,17 @@ using Update = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *
                                          const D3D11_BOX *, const void *, UINT, UINT);
 using Clear = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11DepthStencilView *, UINT,
                                         FLOAT, UINT8);
+using CopyRegion = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, UINT, UINT,
+                                             UINT, UINT, ID3D11Resource *, UINT, const D3D11_BOX *);
+using Copy = void(STDMETHODCALLTYPE *)(ID3D11DeviceContext *, ID3D11Resource *, ID3D11Resource *);
 static DI oldDI;
 static D oldD;
 static Map oldMap;
 static Unmap oldUnmap;
 static Update oldUpdate;
 static Clear oldClear;
+static CopyRegion oldCopyRegion;
+static Copy oldCopy;
 // Replay and constant uploads bypass hooks installed below this one. Null
 // falls back to the old* chain (tests, standalone builds).
 static DI replayDI;
@@ -208,6 +214,10 @@ struct Draw {
     // Native pixel-shader alpha (b4): below 1 for see-through creatures, such
     // as a rogue in stealth; they cast a proportionally lighter shadow.
     float alpha = 1;
+    // TightModelBounds: the mesh's measured local box (ModelBounds.h), used
+    // only for caster culling.
+    bool localBounds = false;
+    float boundsCenter[3]{}, boundsHalf[3]{};
     // A blended see-through model: it casts (dithered) but is never replayed as
     // a receiver or drawn with the inline shaders.
     bool casterOnly = false;
@@ -326,9 +336,11 @@ static UINT lastTerrainCasters = 0, lastModelCasters = 0, lastReceivers = 0, las
             lastInlineModels = 0;
 static bool batchCastersEnabled = true;
 static bool tightTerrainBounds = true;
+static bool tightModelBounds = true;
 static unsigned lastModelCasterDraws = 0, lastBatchedCasters = 0, lastTranslucentCasters = 0;
 static unsigned terrainCandidates = 0, terrainSubmissions = 0;
 static void initializeCasterBatches();
+static void initializeModelBounds();
 static void clearTerrain() {
     for (auto &m : terrainMeshes) {
         drop(m.vb);
@@ -1036,6 +1048,8 @@ static bool initialize(ID3D11DeviceContext *context) {
         ok = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &constants));
     if (ok && batchCastersEnabled)
         initializeCasterBatches(); // Optional; allocation/compile failure retains normal draws.
+    if (ok && tightModelBounds)
+        initializeModelBounds(); // Optional; failure keeps +/-255 model bounds.
     if (ok && inlineTerrainEnabled) {
         // Inline terrain is optional: any failure keeps the receiver pass for terrain.
         bool inlineOk = SUCCEEDED(device->CreateBuffer(&cb, nullptr, &inlineConstants)) &&
@@ -1400,10 +1414,20 @@ static void bind(const Draw &x, Params &p) {
 
 // Conservative world box of a native mesh. Shaders expand normalized positions
 // by 255. Terrain chunks span 64 blocks horizontally (plus a block for motion)
-// and 0..255 vertically; models use +/-255 so signed formats stay covered.
+// and 0..255 vertically; models use +/-255 so signed formats stay covered,
+// or (casters, TightModelBounds) their mesh's measured box.
 static void drawBounds(const Draw &draw, float center[3], float extent[3],
-                       bool cachedTerrain = false) {
+                       bool cachedTerrain = false, bool measured = false) {
     bool terrain = draw.terrain || cachedTerrain;
+    if (!terrain && measured && tightModelBounds && draw.localBounds) {
+        const float *c = draw.boundsCenter, *h = draw.boundsHalf;
+        for (int row = 0; row < 3; ++row) {
+            const float *m = draw.world + row * 4;
+            center[row] = m[0] * c[0] + m[1] * c[1] + m[2] * c[2] + m[3];
+            extent[row] = std::abs(m[0]) * h[0] + std::abs(m[1]) * h[1] + std::abs(m[2]) * h[2];
+        }
+        return;
+    }
     float horizontal = terrain ? 32.f : 0.f, vertical = terrain ? 127.5f : 0.f;
     float halfHorizontal = terrain ? 33.f : 255.f, halfVertical = terrain ? 127.5f : 255.f;
     for (int row = 0; row < 3; ++row) {
@@ -1418,7 +1442,7 @@ static void drawBounds(const Draw &draw, float center[3], float extent[3],
 // wholly outside the orthographic map cannot write any of its texels.
 static bool intersectsMap(const Draw &draw, const Params &parameters, bool cachedTerrain = false) {
     float center[3], half[3];
-    drawBounds(draw, center, half, cachedTerrain);
+    drawBounds(draw, center, half, cachedTerrain, true);
     for (int row : {0, 4}) {
         const float *m = parameters.light + row;
         float projected = m[0] * center[0] + m[1] * center[1] + m[2] * center[2] + m[3];
@@ -1428,6 +1452,16 @@ static bool intersectsMap(const Draw &draw, const Params &parameters, bool cache
             return false;
     }
     return true;
+}
+// intersectsMap for model casters, counted per map for the periodic log.
+static unsigned casterCascade = 0;
+static unsigned modelCandidates[2]{}, modelAccepted[2]{};
+static bool modelCastsInto(const Draw &draw, const Params &parameters) {
+    bool inside = intersectsMap(draw, parameters);
+    unsigned map = casterCascade ? 1 : 0;
+    ++modelCandidates[map];
+    modelAccepted[map] += inside;
+    return inside;
 }
 // Receiver fade reaches zero at the shadow radius (ground distance, or full
 // camera distance with CameraFade), where the receiver leaves the scene color
@@ -1444,6 +1478,7 @@ static bool beyondFade(const Draw &draw, const Params &parameters) {
 }
 
 #include "CasterBatches.h"
+#include "ModelBounds.h"
 
 // Caster pass, terrain: every loaded chunk positioned relative to the render
 // origin derived from `reference`. Model casters are submitted separately.
@@ -1515,6 +1550,7 @@ static void renderCasters(Params &p, unsigned cascade) {
     bool nearPass = cascade != 0;
     UINT passResolution = nearPass ? nearResolution : resolution;
     float passRadius = nearPass ? nearRadius : radius;
+    casterCascade = cascade;
     ctx->OMSetRenderTargets(0, nullptr, nearPass ? nearDepth : mapDepth);
     oldClear(ctx, nearPass ? nearDepth : mapDepth, D3D11_CLEAR_DEPTH, 1, 0);
     D3D11_VIEWPORT vp{0, 0, (float)passResolution, (float)passResolution, 0, 1};
@@ -1703,6 +1739,10 @@ static void render() {
     lastModelCasters = 0;
     lastModelCasterDraws = lastBatchedCasters = lastTranslucentCasters = 0;
     terrainCandidates = terrainSubmissions = 0;
+    for (unsigned map = 0; map < 2; ++map)
+        modelCandidates[map] = modelAccepted[map] = 0;
+    if (tightModelBounds)
+        resolveModelBounds();
     for (unsigned cascade = 0; cascade < (cascadesEnabled ? 2u : 1u); ++cascade) {
         if (cascade)
             memcpy(p.light, receiverParameters.nearLight, 64);
@@ -1713,6 +1753,9 @@ static void render() {
 
     // 2. Receiver pass over the scene.
     renderReceivers(p, originalViewport);
+    // 3. Mesh bounds requested above, read back in a later frame.
+    if (tightModelBounds)
+        measureModelBounds();
     ID3D11ShaderResourceView *nullViews[2]{};
     ctx->PSSetShaderResources(0, 2, nullViews);
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -1741,6 +1784,26 @@ static void render() {
                   "TightTerrainBounds=%d",
                   terrainCandidates, terrainSubmissions, tightTerrainBounds);
         log(line);
+        auto &b = boundsStats;
+        sprintf_s(line,
+                  "Model caster culling: far map %u of %u candidates, near map %u of %u; "
+                  "measured boxes for %u of %u model draws, TightModelBounds=%d",
+                  modelAccepted[0], modelCandidates[0], modelAccepted[1], modelCandidates[1],
+                  b.tightDraws, b.modelDraws, tightModelBounds);
+        log(line);
+        if (tightModelBounds) {
+            size_t pending = 0;
+            for (auto &entry : boundsCache)
+                pending += entry.second.state == BOUNDS_PENDING;
+            sprintf_s(line,
+                      "Mesh bounds (since last line): %u measured, %u unbounded, %u invalidated by "
+                      "writes, %u skipped lookups (written/GPU-writable/animated); cache %zu "
+                      "entries, %zu pending, %u resets",
+                      b.measured, b.unbounded, b.invalidated, b.skipped, boundsCache.size(),
+                      pending, b.resets);
+            log(line);
+            b.measured = b.unbounded = b.invalidated = b.skipped = 0;
+        }
         auto &t = seeThrough;
         sprintf_s(line,
                   "See-through models (since last line, of %u world draws): faded casters %u "
@@ -2252,6 +2315,8 @@ static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, 
         UINT size = bufferBytes(r);
         if (size)
             mapped[r] = {m->pData, size};
+        else if (tightModelBounds)
+            noteBufferWrite(r);
     }
     return hr;
 }
@@ -2265,12 +2330,26 @@ static void STDMETHODCALLTYPE unmap(ID3D11DeviceContext *c, ID3D11Resource *r, U
 }
 static void STDMETHODCALLTYPE update(ID3D11DeviceContext *c, ID3D11Resource *r, UINT s,
                                      const D3D11_BOX *box, const void *data, UINT row, UINT slice) {
-    if (!internal && !box && s == 0 && data) {
-        UINT size = bufferBytes(r);
-        if (size)
-            r->SetPrivateData(cacheGuid, size, data);
-    }
+    UINT size = internal ? 0 : bufferBytes(r);
+    if (!internal && !box && s == 0 && data && size)
+        r->SetPrivateData(cacheGuid, size, data);
+    if (!internal && !size && tightModelBounds)
+        noteBufferWrite(r);
     oldUpdate(c, r, s, box, data, row, slice);
+}
+// Copies into a measured mesh buffer retire its bounds (TightModelBounds only).
+static void STDMETHODCALLTYPE copyRegion(ID3D11DeviceContext *c, ID3D11Resource *dst, UINT dstSub,
+                                         UINT x, UINT y, UINT z, ID3D11Resource *src, UINT srcSub,
+                                         const D3D11_BOX *box) {
+    if (!internal)
+        noteBufferWrite(dst);
+    oldCopyRegion(c, dst, dstSub, x, y, z, src, srcSub, box);
+}
+static void STDMETHODCALLTYPE copy(ID3D11DeviceContext *c, ID3D11Resource *dst,
+                                   ID3D11Resource *src) {
+    if (!internal)
+        noteBufferWrite(dst);
+    oldCopy(c, dst, src);
 }
 // A depth clear starts a new scene: finish the previous one and handle toggles.
 static void STDMETHODCALLTYPE clear(ID3D11DeviceContext *c, ID3D11DepthStencilView *v, UINT flags,
@@ -2317,7 +2396,9 @@ static bool install(ID3D11DeviceContext *c) {
                     {SLOT_MAP, (void *)map, (void **)&oldMap},
                     {SLOT_UNMAP, (void *)unmap, (void **)&oldUnmap},
                     {SLOT_UPDATE_SUBRESOURCE, (void *)update, (void **)&oldUpdate},
-                    {SLOT_CLEAR_DEPTH_STENCIL_VIEW, (void *)clear, (void **)&oldClear}};
+                    {SLOT_CLEAR_DEPTH_STENCIL_VIEW, (void *)clear, (void **)&oldClear},
+                    {SLOT_COPY_SUBRESOURCE_REGION, (void *)copyRegion, (void **)&oldCopyRegion},
+                    {SLOT_COPY_RESOURCE, (void *)copy, (void **)&oldCopy}};
     for (auto &h : hooks)
         *h.original = v[h.slot];
     replayDI = oldDI;
@@ -2336,12 +2417,17 @@ static bool install(ID3D11DeviceContext *c) {
         replayD = moonlight::oldD;
         rawMap = moonlight::oldMap;
         rawUnmap = moonlight::oldUnmap;
+        // MoonLight's Map/Update hooks report mesh-buffer writes instead.
+        if (tightModelBounds)
+            moonlight::bufferWritten = noteBufferWrite;
     }
 #endif
     int done = 0;
     for (auto &h : hooks) {
-        if (shareConstants && (h.slot == SLOT_MAP || h.slot == SLOT_UNMAP ||
-                               h.slot == SLOT_UPDATE_SUBRESOURCE)) {
+        bool copySlot = h.slot == SLOT_COPY_SUBRESOURCE_REGION || h.slot == SLOT_COPY_RESOURCE;
+        if ((shareConstants && (h.slot == SLOT_MAP || h.slot == SLOT_UNMAP ||
+                                h.slot == SLOT_UPDATE_SUBRESOURCE)) ||
+            (copySlot && !tightModelBounds)) {
             done++;
             continue;
         }
@@ -2378,6 +2464,7 @@ static void loadSettings() {
     inlineModelsEnabled = GetPrivateProfileIntW(L"Shadows", L"InlineModels", 1, ini) != 0;
     batchCastersEnabled = GetPrivateProfileIntW(L"Shadows", L"BatchCasters", 1, ini) != 0;
     tightTerrainBounds = GetPrivateProfileIntW(L"Shadows", L"TightTerrainBounds", 1, ini) != 0;
+    tightModelBounds = GetPrivateProfileIntW(L"Shadows", L"TightModelBounds", 1, ini) != 0;
     nearResolution =
         std::clamp((UINT)GetPrivateProfileIntW(L"Shadows", L"NearResolution", 2048, ini), 512u,
                    4096u);

@@ -88,7 +88,7 @@ struct CasterPlan {
         links.clear();
         worlds.clear();
         for (const auto &x : draws) {
-            if (x.terrain || x.lilyPad || x.alpha < OPAQUE_ALPHA || !intersectsMap(x, p))
+            if (x.terrain || x.lilyPad || x.alpha < OPAQUE_ALPHA || !modelCastsInto(x, p))
                 continue;
             auto slot = lookup.emplace(casterKey(x), groups.size());
             size_t link = links.size();
@@ -123,7 +123,7 @@ static void renderTranslucentCasters(Params &p) {
     float savedAlpha = p.modelAmbient[3];
     for (const auto &x : draws) {
         if (x.terrain || x.lilyPad || x.alpha >= OPAQUE_ALPHA || x.alpha < INVISIBLE_ALPHA ||
-            !intersectsMap(x, p))
+            !modelCastsInto(x, p))
             continue;
         if (!bound) {
             ctx->PSSetShader(translucentCaster, nullptr, 0);
@@ -149,7 +149,7 @@ static void renderModelCasters(Params &p) {
 static void renderOpaqueModelCasters(Params &p) {
     auto ordinary = [&] {
         for (const auto &x : draws)
-            if (!x.terrain && !x.lilyPad && x.alpha >= OPAQUE_ALPHA && intersectsMap(x, p)) {
+            if (!x.terrain && !x.lilyPad && x.alpha >= OPAQUE_ALPHA && modelCastsInto(x, p)) {
                 bind(x, p);
                 ++lastModelCasters;
                 ++lastModelCasterDraws;

@@ -37,6 +37,12 @@ clang-cl /nologo /O2 /MD /std:c++17 /UNDEBUG  /Ivendor\cwmods SteamShadows\Model
 if errorlevel 1 exit /b 1
 build-mobile\ModelPlaneTest.exe
 if errorlevel 1 exit /b 1
+clang-cl /nologo /O2 /MD /std:c++17 /UNDEBUG  /Ivendor\cwmods SteamShadows\ModelBoundsTest.cpp /Fobuild-mobile\ModelBoundsTest.obj /Febuild-mobile\ModelBoundsTest.exe /link d3d11.lib dxgi.lib d3dcompiler.lib user32.lib winmm.lib
+if errorlevel 1 exit /b 1
+build-mobile\ModelBoundsTest.exe
+if errorlevel 1 exit /b 1
+build-mobile\ModelBoundsTest.exe warp
+if errorlevel 1 exit /b 1
 clang-cl /nologo /O2 /MD /std:c++17 /UNDEBUG  /Ivendor\cwmods SteamShadows\NativeClipTest.cpp /Fobuild-mobile\NativeClipTest.obj /Febuild-mobile\NativeClipTest.exe /link d3d11.lib dxgi.lib d3dcompiler.lib user32.lib winmm.lib
 if errorlevel 1 exit /b 1
 build-mobile\NativeClipTest.exe %2

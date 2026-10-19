@@ -70,3 +70,7 @@ Models use direct world-space position and inverse-transpose normals, following 
 This aims for continuous hair/face contact shadows with a visible ambient-lit face. It approximates the lighting components inside Steam's existing pipeline; live appearance and performance must still be checked against the references. See PERFORMANCE.md for the current implementation and validation details.
 
 Noon adjustment: vertical model faces receive consistent directional shade at grazing light angles, with a smooth transition back to ordinary shadow sampling as they turn toward the light. This retains native ambient/local illumination and normal shading on upward-facing surfaces. Fully shaded faces skip the shadow gather; terrain filtering and map sizes are unchanged. The 160-case GPU plane sweep checks phase stability across the transition; live reference comparison remains necessary.
+
+## Model caster bounds
+
+`TightModelBounds=1` (default) culls model shadow casters with each mesh's real size. Before, every model part counted as a box reaching 21–40 blocks from it in every direction, so the near map drew almost every visible model. Each mesh is measured once on the GPU and read back a few frames later without waiting; until then, and for meshes the game keeps rewriting, the old box is used. Rewriting a mesh discards its measurement. The shadow image is unchanged (bit-identical depth in the tests). `TightModelBounds=0` restores the old culling for comparison. It is not yet verified in game or on GameNative; see PERFORMANCE.md for what to compare in the log.
