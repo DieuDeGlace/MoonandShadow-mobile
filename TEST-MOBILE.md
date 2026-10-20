@@ -30,3 +30,11 @@ Built Windows x64 DLLs with clang-cl /O2. All nine shadow tests passed, includin
 Installed into the actual GameNative Steam folder with a rollback installer; three DLLs byte-compared successfully. Pixel 10 Pro / Android 17 / GameNative 1.2.1 loaded into Groron Hills; HUD and terrain rendered. Logs confirm model receiver/cascades active and TAA resolves. User reported: "Looks steadier; speed feels similar." No matched gameplay FPS benchmark or long-session test was performed. Wine's shader compiler reports a potential-uninitialized warning for modelPlaneVisibility; all return paths are defined, compilation completes, and rendering tests/device initialization succeed. This warning is retained in diagnostics rather than suppressed.
 
 Rollback: close GameNative and restore all three backed-up DLLs together. Keep the existing INIs. The normal Steam-folder launcher was restored after the one-time installer. Geo/.NET, saves, Steam auth, driver/DXVK/Proton and other installed mods were not replaced.
+
+## October 19 model-bounds update
+
+Built code at 4d99a58, incorporating desktop main through 817bec9: tight model bounds, away-facing caster handling and the recent moon corrections. The cached mobile executable identity remains 0x5d93ab0d / 0x58a000; rendering algorithms follow upstream. The phone's existing shadow, moon, wind and TAA settings were preserved.
+
+All 18 shadow tests passed. CTest initially skipped four tests requiring the private Steam executable; NativeClipTest, NativeEquivalenceTest and both InlineTerrainTest modes then passed with that local fixture. Native clip comparison covered 4,608 values with zero ULP discrepancy. No game/shader fixture is distributed.
+
+The installed DLL was read back from the actual GameNative Steam Mods folder and SHA-256 matched the build. Pixel 10 Pro / Android 17 loaded the existing character into Deskor Hills with terrain and HUD visible. This was a short integration check, not a sustained frame-rate or all-weather test. Runtime, launcher, Geo/.NET, saves and existing INIs were retained. A compact rollback archive accompanies the local installation record.
